@@ -47,3 +47,4 @@ htmlcov/
 *.local
 mb_demo*.db
 mb_*.db
+mirror_brain.db
