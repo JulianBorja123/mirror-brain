@@ -231,14 +231,31 @@ class LinkEvolution:
 
     def _execute_link(self, from_ent: str, to_ent: str, relation: str,
                       reasoning: str, confidence: float):
-        """Create a relation in the registry + log reasoning."""
+        """Create a relation in the registry + log reasoning. Deduplicates."""
         from_uuid = self.registry.resolve(from_ent)
         to_uuid = self.registry.resolve(to_ent)
+
+        # Fallback: search for partial matches
+        if not from_uuid:
+            results = self.registry.search(from_ent)
+            if results:
+                from_uuid = results[0]["uuid"]
+        if not to_uuid:
+            results = self.registry.search(to_ent)
+            if results:
+                to_uuid = results[0]["uuid"]
 
         if not from_uuid or not to_uuid:
             return
 
-        # Store relation
+        # Check for existing relation (dedup)
+        existing = self.registry.db.execute(
+            "SELECT 1 FROM relations WHERE from_uuid=? AND to_uuid=? AND relation_type=?",
+            (from_uuid, to_uuid, relation),
+        ).fetchone()
+        if existing:
+            return  # already exists
+
         self.registry.db.execute(
             "INSERT INTO relations (from_uuid, to_uuid, relation_type, source_text, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
@@ -300,8 +317,15 @@ class LinkEvolution:
 
     def _execute_alias(self, alias_name: str, canonical: str,
                        confidence: float, reasoning: str):
-        """Register a new alias."""
+        """Register a new alias. Tries exact match first, then search."""
         target_uuid = self.registry.resolve(canonical)
+        
+        # Fallback: try search if exact resolve fails
+        if not target_uuid:
+            results = self.registry.search(canonical)
+            if results:
+                target_uuid = results[0]["uuid"]
+        
         if not target_uuid:
             return
 
