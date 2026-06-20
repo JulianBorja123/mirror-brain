@@ -84,5 +84,29 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
     """)
 
+    # 6. raw_texts — raw input text storage
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raw_texts (
+            uuid            TEXT PRIMARY KEY,
+            content         TEXT NOT NULL,
+            char_count      INTEGER,
+            source          TEXT DEFAULT '',
+            created_at      TEXT
+        )
+    """)
+
+    # 7. weekly_summaries — weekly aggregated summaries
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS weekly_summaries (
+            week_start      TEXT PRIMARY KEY,
+            summary         TEXT,
+            key_entities    TEXT DEFAULT '[]',
+            key_themes      TEXT DEFAULT '[]',
+            emotional_arc   TEXT DEFAULT '[]',
+            source_days     TEXT DEFAULT '[]',
+            created_at      TEXT
+        )
+    """)
+
     conn.commit()
     return conn

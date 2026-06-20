@@ -68,7 +68,7 @@ def clean_db(db_path: str, conn: sqlite3.Connection | None = None):
 # ═══════════════════════════════════════════════════════════════════
 
 def test_schema_creates_five_tables():
-    """init_db should create exactly 5 tables."""
+    """init_db should create exactly 7 tables."""
     db_path = make_temp_db()
     conn = None
     try:
@@ -78,7 +78,7 @@ def test_schema_creates_five_tables():
             " AND name NOT LIKE 'sqlite_%' ORDER BY name"
         )
         tables = [row[0] for row in cursor.fetchall()]
-        expected = ["aliases", "daily_index", "entities", "reasoning_trail", "relations"]
+        expected = ["aliases", "daily_index", "entities", "raw_texts", "reasoning_trail", "relations", "weekly_summaries"]
         assert tables == expected, f"Expected {expected}, got {tables}"
         print("PASS: test_schema_creates_five_tables")
     finally:
@@ -123,7 +123,7 @@ def test_schema_idempotent():
             " AND name NOT LIKE 'sqlite_%' ORDER BY name"
         )
         tables = [row[0] for row in cursor.fetchall()]
-        assert len(tables) == 5, f"Expected 5 tables, got {len(tables)}: {tables}"
+        assert len(tables) == 7, f"Expected 7 tables, got {len(tables)}: {tables}"
         conn2.close()
         print("PASS: test_schema_idempotent")
     finally:
