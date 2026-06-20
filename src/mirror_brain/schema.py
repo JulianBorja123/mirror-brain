@@ -108,5 +108,58 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
     """)
 
+    # 8. monthly_summaries — monthly aggregated summaries
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_summaries (
+            month_start     TEXT PRIMARY KEY,
+            summary         TEXT NOT NULL DEFAULT '',
+            emotional_arc   TEXT NOT NULL DEFAULT '[]',
+            key_entities    TEXT NOT NULL DEFAULT '[]',
+            key_themes      TEXT NOT NULL DEFAULT '[]',
+            source_weeks    TEXT NOT NULL DEFAULT '[]',
+            created_at      TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # 9. procedures — named procedural workflows (v3)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS procedures (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            name            TEXT UNIQUE NOT NULL,
+            steps           TEXT NOT NULL DEFAULT '[]',
+            context         TEXT NOT NULL DEFAULT '',
+            success_count   INTEGER NOT NULL DEFAULT 0,
+            fail_count      INTEGER NOT NULL DEFAULT 0,
+            last_used       TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # 10. procedural_traces — execution traces for procedures (v3)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS procedural_traces (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp         TEXT NOT NULL DEFAULT '',
+            action_sequence   TEXT NOT NULL DEFAULT '[]',
+            entities_involved TEXT NOT NULL DEFAULT '[]',
+            outcome           TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # 11. media — multimodal input storage (text, audio, image)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS media (
+            uuid                TEXT PRIMARY KEY,
+            media_type          TEXT NOT NULL CHECK(media_type IN ('text','audio','image')),
+            filepath            TEXT,
+            metadata            TEXT DEFAULT '{}',
+            transcription       TEXT,
+            description         TEXT,
+            entities_extracted  TEXT DEFAULT '[]',
+            ingested_at         TEXT,
+            source              TEXT
+        )
+    """)
+
     conn.commit()
     return conn

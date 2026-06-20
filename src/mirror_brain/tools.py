@@ -366,6 +366,268 @@ class SearchTools:
             for row in rows
         ]
 
+    # ── 8. Procedural memory search ─────────────────────────────
+
+    @staticmethod
+    def search_procedures(
+        registry,              # EntityRegistry
+        query: str,
+        limit: int = 5,
+    ) -> list[dict]:
+        """Fuzzy-match *query* against stored procedures via ProceduralMemory.
+
+        Returns ranked procedure suggestions, or an empty list if the
+        ``procedural`` module or ``procedures`` table is unavailable.
+        """
+        try:
+            from .procedural import ProceduralMemory
+        except Exception:
+            return []
+        try:
+            pm = ProceduralMemory(registry)
+            return pm.suggest_procedure(query, limit=limit)
+        except Exception:
+            return []
+
+    # ── 9. Procedure detail lookup ──────────────────────────────
+
+    @staticmethod
+    def get_procedure(
+        registry,              # EntityRegistry
+        name: str,
+    ) -> dict:
+        """Return full details for a named procedure.
+
+        Reads from the ``procedures`` table directly.  Returns a dict
+        with ``error`` if the table is missing or the procedure
+        is not found.
+        """
+        try:
+            row = registry.db.execute(
+                "SELECT name, steps, context, success_count, fail_count, "
+                "last_used, created_at "
+                "FROM procedures "
+                "WHERE name = ?",
+                (name,),
+            ).fetchone()
+        except Exception:
+            return {"error": "procedures table unavailable", "name": name}
+
+        if row is None:
+            return {"error": f"procedure {name!r} not found", "name": name}
+
+        # Decode steps JSON safely
+        try:
+            steps = json.loads(row[1]) if row[1] else []
+        except (json.JSONDecodeError, TypeError):
+            steps = []
+
+        total = row[3] + row[4]
+        success_rate = (row[3] / total) if total > 0 else None
+
+        return {
+            "name":          row[0],
+            "steps":         steps,
+            "context":       row[2],
+            "success_count": row[3],
+            "fail_count":    row[4],
+            "success_rate":  round(success_rate, 4) if success_rate is not None else None,
+            "last_used":     row[5],
+            "created_at":    row[6],
+        }
+
+    # ── 10. Temporal range search ───────────────────────────────
+
+    @staticmethod
+    def search_temporal_range(
+        registry,                # EntityRegistry
+        start_days_ago: int,
+        end_days_ago: int,
+    ) -> list[dict]:
+        """Return daily_index entries between *start_days_ago* and *end_days_ago*.
+
+        ``start_days_ago`` must be larger (older) than ``end_days_ago``
+        to form a valid range into the past.  Results are ordered by
+        date ascending.
+        """
+        today = date.today()
+        # Ensure start is the older date (further in the past)
+        if start_days_ago < end_days_ago:
+            start_days_ago, end_days_ago = end_days_ago, start_days_ago
+
+        start_date = today - timedelta(days=start_days_ago)
+        end_date = today - timedelta(days=end_days_ago)
+
+        try:
+            rows = registry.db.execute(
+                "SELECT date, summary, emotional_arc, key_entities, key_decisions "
+                "FROM daily_index "
+                "WHERE date >= ? AND date <= ? "
+                "ORDER BY date ASC",
+                (start_date.isoformat(), end_date.isoformat()),
+            ).fetchall()
+        except Exception:
+            return []
+
+        return [
+            {
+                "date":          row[0],
+                "summary":       row[1],
+                "emotional_arc": json.loads(row[2]) if row[2] else [],
+                "key_entities":  json.loads(row[3]) if row[3] else [],
+                "key_decisions": json.loads(row[4]) if row[4] else [],
+            }
+            for row in rows
+        ]
+
+    # ── 11. Monthly summary lookup ──────────────────────────────
+
+    @staticmethod
+    def get_monthly_summary(
+        registry,                  # EntityRegistry
+        month_start: Optional[str] = None,
+    ) -> dict:
+        """Return a monthly_summaries entry.
+
+        If *month_start* is ``None``, returns the most recent month.
+        The ``month_start`` must be the first day of the month in ISO
+        format (``YYYY-MM-DD``).
+        """
+        try:
+            if month_start is None:
+                row = registry.db.execute(
+                    "SELECT month_start, summary, emotional_arc, key_entities, "
+                    "key_themes, source_weeks, created_at "
+                    "FROM monthly_summaries "
+                    "ORDER BY month_start DESC "
+                    "LIMIT 1"
+                ).fetchone()
+            else:
+                # Normalise to first of month
+                try:
+                    d = date.fromisoformat(month_start)
+                except (ValueError, TypeError):
+                    return {"error": f"invalid month_start: {month_start!r}"}
+                first = d.replace(day=1)
+                row = registry.db.execute(
+                    "SELECT month_start, summary, emotional_arc, key_entities, "
+                    "key_themes, source_weeks, created_at "
+                    "FROM monthly_summaries "
+                    "WHERE month_start = ?",
+                    (first.isoformat(),),
+                ).fetchone()
+        except Exception:
+            return {"month_start": month_start, "error": "monthly_summaries table unavailable"}
+
+        if row is None:
+            return {"month_start": month_start or "latest", "error": "not found"}
+
+        return {
+            "month_start":    row[0],
+            "summary":        row[1],
+            "emotional_arc":  json.loads(row[2]) if row[2] else [],
+            "key_entities":   json.loads(row[3]) if row[3] else [],
+            "key_themes":     json.loads(row[4]) if row[4] else [],
+            "source_weeks":   json.loads(row[5]) if row[5] else [],
+            "created_at":     row[6],
+        }
+
+    # ── 12. Cycle detection ─────────────────────────────────────
+
+    @staticmethod
+    def search_cycles(
+        registry,                # EntityRegistry
+        entity_name: str,
+        metric: str = "oxytocin",
+    ) -> dict:
+        """Detect periodic cycles via PredictiveEngine.detect_cycles.
+
+        Returns a ``has_cycle`` / ``period_days`` / ``confidence`` dict,
+        or a fallback dict on error.
+        """
+        try:
+            from .predictive import PredictiveEngine
+        except Exception:
+            return {"has_cycle": False, "period_days": 0, "confidence": 0.0,
+                    "error": "predictive module unavailable"}
+        try:
+            pe = PredictiveEngine(registry)
+            return pe.detect_cycles(entity_name, metric=metric)
+        except Exception:
+            return {"has_cycle": False, "period_days": 0, "confidence": 0.0,
+                    "error": "cycle detection failed"}
+
+    # ── 13. Trend report ────────────────────────────────────────
+
+    @staticmethod
+    def get_trend(
+        registry,                # EntityRegistry
+        entity_name: str,
+        metric: str = "oxytocin",
+        window: int = 30,
+    ) -> dict:
+        """Return a linear-regression trend report via PredictiveEngine.trend_report.
+
+        Returns a ``direction`` / ``slope`` / ``r_squared`` / ``confidence``
+        dict, or a fallback on error.
+        """
+        try:
+            from .predictive import PredictiveEngine
+        except Exception:
+            return {"direction": "stable", "slope": 0.0, "r_squared": 0.0,
+                    "confidence": 0.0, "error": "predictive module unavailable"}
+        try:
+            pe = PredictiveEngine(registry)
+            return pe.trend_report(entity_name, metric=metric, window=window)
+        except Exception:
+            return {"direction": "stable", "slope": 0.0, "r_squared": 0.0,
+                    "confidence": 0.0, "error": "trend report failed"}
+
+    # ── 14. Anomaly detection ───────────────────────────────────
+
+    @staticmethod
+    def get_anomalies(
+        registry,                # EntityRegistry
+        entity_name: str,
+        metric: str = "oxytocin",
+    ) -> list[dict]:
+        """Flag outlier days via PredictiveEngine.anomaly_detect.
+
+        Returns a list of ``{date, value, zscore}`` dicts for flagged
+        outliers, or an empty list on error.
+        """
+        try:
+            from .predictive import PredictiveEngine
+        except Exception:
+            return []
+        try:
+            pe = PredictiveEngine(registry)
+            return pe.anomaly_detect(entity_name, metric=metric)
+        except Exception:
+            return []
+
+    # ── 15. Memory budget ───────────────────────────────────────
+
+    @staticmethod
+    def get_memory_budget(
+        registry,                # EntityRegistry
+    ) -> dict:
+        """Return counts at each consolidation tier via HierarchicalConsolidation.
+
+        Returns ``{daily, weekly, monthly}`` counts, or zeros on error.
+        """
+        try:
+            from .consolidation import HierarchicalConsolidation
+        except Exception:
+            return {"daily": 0, "weekly": 0, "monthly": 0,
+                    "error": "consolidation module unavailable"}
+        try:
+            hc = HierarchicalConsolidation(registry)
+            return hc.get_memory_budget()
+        except Exception:
+            return {"daily": 0, "weekly": 0, "monthly": 0,
+                    "error": "memory budget query failed"}
+
 
 # ── Internal helpers ────────────────────────────────────────────
 

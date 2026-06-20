@@ -1,6 +1,6 @@
 """
-Mirror Brain v2 — Agentic Pipeline.
-The agent has tools, activates memory, loops if needed, and decides.
+Mirror Brain v3 — Agentic Pipeline with procedural memory, consolidation,
+predictive engine, and multi-modal support.
 """
 import json
 import re
@@ -12,7 +12,7 @@ from .tools import SearchTools
 from .preprocessor import TextPreprocessor
 
 
-AGENT_SYSTEM_PROMPT = """You are the Mirror Brain Agent v2, an agentic memory system.
+AGENT_SYSTEM_PROMPT = """You are the Mirror Brain Agent v3, an agentic memory system.
 
 You have ACCESS TO TOOLS that searched the brain for you. The results are below.
 You also have the original text. Your job: decide what to create, link, evolve.
@@ -67,6 +67,24 @@ Analyze the text and the retrieved context. Return JSON with:
       "reasoning": "why"
     }}
   ],
+  "procedures_learned": [
+    {{
+      "name": "procedure name",
+      "steps": ["step 1", "step 2"],
+      "context": "when to use this procedure",
+      "confidence": 0.0-1.0
+    }}
+  ],
+  "projections": [
+    {{
+      "entity": "entity name",
+      "metric": "emotional|activity|growth",
+      "direction": "up|down|stable",
+      "horizon": "next week|next month",
+      "confidence": 0.0-1.0,
+      "reasoning": "why"
+    }}
+  ],
   "needs_more_search": [
     "specific search request"
   ],
@@ -77,6 +95,8 @@ Analyze the text and the retrieved context. Return JSON with:
 - Only entities EXPLICITLY in the text. Use alias_of if it matches an existing entity.
 - Links: connect only when evidence exists in text + retrieved context.
 - Evolutions: update context when text changes our understanding.
+- Procedures: if the text describes a repeatable workflow, extract it.
+- Projections: if trend data is available and text suggests future direction.
 - needs_more_search: ONLY if truly insufficient context. Max 2 items.
 - Confidence: >0.85=auto, 0.6-0.85=flag, <0.6=skip.
 - Past decisions with reverted=true: avoid repeating those mistakes.
@@ -85,10 +105,12 @@ Return ONLY valid JSON. No markdown fences."""
 
 
 class MirrorBrainAgent:
-    """v2 Agent: tools → activate → decide → loop → execute."""
+    """v3 Agent: tools → activate → decide → loop → execute → consolidate."""
 
     def __init__(self, registry: EntityRegistry, llm_call: Callable,
-                 c0_client=None, max_loops: int = 3):
+                 c0_client=None, max_loops: int = 3,
+                 procedural=None, consolidation=None,
+                 predictive=None, multimodal=None):
         self.registry = registry
         self.llm = llm_call
         self.c0 = c0_client
@@ -96,8 +118,14 @@ class MirrorBrainAgent:
         self.preprocessor = TextPreprocessor()
         self.max_loops = max_loops
 
+        # v3 modules (optional — gracefully degrade if None)
+        self.procedural = procedural
+        self.consolidation = consolidation
+        self.predictive = predictive
+        self.multimodal = multimodal
+
     def process(self, text: str) -> dict:
-        """Full v2 pipeline. Returns execution report."""
+        """Full v3 pipeline. Returns execution report."""
         # 0. Save raw text
         self._save_raw_text(text)
 
@@ -105,7 +133,7 @@ class MirrorBrainAgent:
         complexity = self.preprocessor.estimate_complexity(text)
         themes = self.preprocessor.split_by_themes(text) if complexity["char_count"] > 500 else [{"theme": "main", "text": text, "start_char": 0, "end_char": len(text)}]
 
-        # 1. ACTIVATION: search brain with tools
+        # 1. ACTIVATION: search brain with tools (v2 + v3)
         all_context = self._activate(text, themes, complexity)
 
         # 2. DECIDE: LLM receives text + context + past decisions
@@ -121,8 +149,14 @@ class MirrorBrainAgent:
                 all_context["extra_searches"] = extra
             decisions = self._decide(text, all_context)
 
+        # 3.5. Process v3-specific decisions
+        decisions = self._process_v3_decisions(decisions, all_context)
+
         # 4. EXECUTE with confidence gates
         report = self._execute(decisions)
+
+        # 5. V3 POST-PROCESS: record procedural trace + auto-consolidate
+        self._post_process(report, decisions, text)
 
         report["complexity"] = complexity
         report["theme_count"] = len(themes)
@@ -134,21 +168,31 @@ class MirrorBrainAgent:
     # ── Activation ──────────────────────────────────────────
 
     def _activate(self, text: str, themes: list, complexity: dict) -> dict:
-        """Search the brain using multiple tools based on text characteristics."""
+        """Search the brain using v2 + v3 tools based on text characteristics."""
         ctx = {
             "temporal_context": [],
             "entity_contexts": {},
             "emotional_matches": [],
             "semantic_matches": [],
             "weekly_summary": None,
+            "monthly_summary": None,
             "fuzzy_matches": [],
+            "trends": {},
+            "cycles": {},
+            "anomalies": [],
+            "memory_budget": None,
+            "procedures_suggested": [],
         }
 
         # Always: temporal context (default window)
         ctx["temporal_context"] = self.tools.search_temporal(self.registry, days_ago=0, window=21)
 
-        # Always: weekly summary
+        # Always: weekly + monthly summary
         ctx["weekly_summary"] = self.tools.get_weekly_summary(self.registry)
+        ctx["monthly_summary"] = self.tools.get_monthly_summary(self.registry)
+
+        # Always: memory budget
+        ctx["memory_budget"] = self.tools.get_memory_budget(self.registry)
 
         # Extract potential entity names from themes
         entity_names = self._extract_potential_entities(themes)
@@ -161,12 +205,44 @@ class MirrorBrainAgent:
             if fuzzy_results:
                 ctx["fuzzy_matches"].extend(fuzzy_results)
 
+            # v3: trends and cycles for recognized entities
+            if minimap and not minimap.get("error"):
+                try:
+                    trend = self.tools.get_trend(self.registry, name, metric="oxytocin", window=30)
+                    if trend and not trend.get("error"):
+                        ctx["trends"][name] = trend
+                except Exception:
+                    pass
+                try:
+                    cycles = self.tools.search_cycles(self.registry, name, metric="oxytocin")
+                    if cycles and cycles.get("has_cycle"):
+                        ctx["cycles"][name] = cycles
+                except Exception:
+                    pass
+
         # Emotional search if text has emotional density
         if complexity.get("emotional_density", 0) > 0.05:
             for emotion in ["oxytocin", "cortisol", "dopamine", "adrenaline"]:
                 matches = self.tools.search_by_emotion(self.registry, emotion, threshold=0.4, limit=5)
                 if matches:
                     ctx["emotional_matches"].extend(matches)
+
+        # Anomaly detection for known entities
+        for name in entity_names[:5]:
+            try:
+                anoms = self.tools.get_anomalies(self.registry, name, metric="oxytocin")
+                if anoms:
+                    ctx["anomalies"].extend([{**a, "entity": name} for a in anoms[:3]])
+            except Exception:
+                pass
+
+        # Procedure suggestions based on text
+        try:
+            procedures = self.tools.search_procedures(self.registry, text[:500], limit=3)
+            if procedures:
+                ctx["procedures_suggested"] = procedures
+        except Exception:
+            pass
 
         # Semantic search on key phrases
         for theme in themes[:3]:
@@ -182,15 +258,22 @@ class MirrorBrainAgent:
         """Execute additional searches requested by LLM."""
         extra = []
         for q in queries[:3]:
-            # Try fuzzy first
             results = self.tools.search_fuzzy(self.registry, q)
             if results:
                 extra.append({"query": q, "type": "fuzzy", "results": results})
-            # Also try semantic if c0 available
             if self.c0:
                 results = self.tools.search_semantic(self.registry, self.c0, q, limit=3)
                 if results:
                     extra.append({"query": q, "type": "semantic", "results": results})
+            # v3: also search procedures
+            proc_results = self.tools.search_procedures(self.registry, q, limit=2)
+            if proc_results:
+                extra.append({"query": q, "type": "procedures", "results": proc_results})
+            # v3: temporal range if date-like
+            if re.search(r'\b(?:semana|mes|week|month|last|next)\b', q, re.IGNORECASE):
+                range_results = self.tools.search_temporal_range(self.registry, 0, 30)
+                if range_results:
+                    extra.append({"query": q, "type": "temporal_range", "results": range_results[:5]})
         return extra
 
     # ── Decision ─────────────────────────────────────────────
@@ -205,6 +288,51 @@ class MirrorBrainAgent:
         )
         raw = self.llm(prompt)
         return self._parse_json(raw)
+
+    # ── V3 Decision Processing ───────────────────────────────
+
+    def _process_v3_decisions(self, decisions: dict, context: dict) -> dict:
+        """Process v3-specific decision fields: procedures_learned, projections."""
+        # Handle procedures_learned — the LLM extracted a workflow
+        if self.procedural:
+            for proc in decisions.get("procedures_learned", []):
+                name = proc.get("name", "")
+                steps = proc.get("steps", [])
+                proc_context = proc.get("context", "")
+                conf = proc.get("confidence", 0)
+                if name and steps and conf >= 0.7:
+                    try:
+                        self.procedural.learn_procedure(name, steps, proc_context)
+                    except Exception:
+                        pass
+
+        # Handle projections — store for later trend comparison
+        for proj in decisions.get("projections", []):
+            entity = proj.get("entity", "")
+            metric = proj.get("metric", "activity")
+            direction = proj.get("direction", "stable")
+            conf = proj.get("confidence", 0)
+            if entity and conf >= 0.6 and self.predictive:
+                target_uuid = self.registry.resolve(entity)
+                if not target_uuid:
+                    search_result = self.registry.search(entity)
+                    target_uuid = search_result[0]["uuid"] if search_result else None
+                if target_uuid:
+                    try:
+                        proj_result = self.predictive.project_next(entity, metric=metric, days=7)
+                        if proj_result:
+                            confidence = proj_result[0].get("confidence", conf) if proj_result else conf
+                            self.registry.log_decision(
+                                "project",
+                                target_uuid,
+                                confidence=confidence,
+                                reasoning=f"projected {direction} — {proj.get('reasoning','')}",
+                                source="predictive_engine",
+                            )
+                    except Exception:
+                        pass
+
+        return decisions
 
     # ── Execution ────────────────────────────────────────────
 
@@ -281,6 +409,33 @@ class MirrorBrainAgent:
         report["stats"] = {"entities": n_ent, "relations": n_rel}
         return report
 
+    # ── V3 Post-Process ──────────────────────────────────────
+
+    def _post_process(self, report: dict, decisions: dict, text: str):
+        """V3 post-processing: record procedural trace, auto-consolidate."""
+        # Record procedural trace from this execution
+        if self.procedural:
+            actions_executed = [a.split(":")[0] if ":" in a else a for a in report.get("auto", [])[:10]]
+            entities_involved = []
+            for ent in decisions.get("entities", []):
+                entities_involved.append(ent.get("name", ""))
+            if actions_executed:
+                outcome = "success" if report.get("auto") else "no_actions"
+                try:
+                    self.procedural.record_trace(actions_executed, entities_involved, outcome)
+                except Exception:
+                    pass
+
+        # Auto-consolidate if memory budget is getting large
+        if self.consolidation:
+            try:
+                budget = self.consolidation.get_memory_budget()
+                total_entries = sum(budget.values())
+                if total_entries > 50:  # threshold: consolidate when over 50 entries
+                    self.consolidation.auto_consolidate()
+            except Exception:
+                pass
+
     # ── Helpers ───────────────────────────────────────────────
 
     def _save_raw_text(self, text: str):
@@ -299,11 +454,8 @@ class MirrorBrainAgent:
         names = set()
         for theme in themes:
             text = theme.get("text", "")
-            # Capitalized words that look like proper nouns
-            import re
             for match in re.finditer(r'\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})?\b', text):
                 names.add(match.group(0))
-            # Also check for known entity mentions
             try:
                 rows = self.registry.db.execute("SELECT canonical_name FROM entities WHERE status='active'").fetchall()
                 lower_text = text.lower()
@@ -341,6 +493,19 @@ class MirrorBrainAgent:
         if ctx.get("weekly_summary"):
             ws = ctx["weekly_summary"]
             c["weekly"] = {"summary": str(ws.get("summary",""))[:300], "dominant_emotion": ws.get("dominant_emotion","")}
+        if ctx.get("monthly_summary"):
+            ms = ctx["monthly_summary"]
+            c["monthly"] = {"summary": str(ms.get("summary",""))[:300]}
+        if ctx.get("trends"):
+            c["trends"] = {k: {"direction": v.get("direction","?"), "confidence": v.get("confidence",0)} for k, v in list(ctx["trends"].items())[:5]}
+        if ctx.get("cycles"):
+            c["cycles"] = {k: {"period_days": v.get("period_days",0), "confidence": v.get("confidence",0)} for k, v in list(ctx["cycles"].items())[:3]}
+        if ctx.get("anomalies"):
+            c["anomalies_count"] = len(ctx["anomalies"])
+        if ctx.get("memory_budget"):
+            c["memory_budget"] = ctx["memory_budget"]
+        if ctx.get("procedures_suggested"):
+            c["procedures"] = [{"name": p.get("name",""), "score": p.get("score",0)} for p in ctx["procedures_suggested"][:5]]
         return c
 
     @staticmethod
@@ -358,4 +523,6 @@ class MirrorBrainAgent:
                     return json.loads(m.group(0))
                 except json.JSONDecodeError:
                     pass
-            return {"entities": [], "links": [], "evolutions": [], "new_aliases": [], "needs_more_search": [], "summary": "parse error"}
+            return {"entities": [], "links": [], "evolutions": [], "new_aliases": [],
+                    "procedures_learned": [], "projections": [],
+                    "needs_more_search": [], "summary": "parse error"}
