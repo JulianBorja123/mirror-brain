@@ -99,8 +99,10 @@ services:
       - -c
       - |
         set -e
+        echo "[c0] Installing prerequisites..."
+        apt-get update -qq && apt-get install -y -qq netcat-openbsd 2>&1 | tail -1
         echo "[c0] Waiting for Neo4j connectivity..."
-        # Simple retry loop until cypher-shell works (Bolt port 7687 reachable)
+        # Simple retry loop until Bolt port 7687 is reachable
         until nc -z neo4j 7687 2>/dev/null; do
           echo "[c0] Neo4j not ready yet — retrying in 3s..."
           sleep 3
