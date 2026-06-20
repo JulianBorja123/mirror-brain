@@ -87,6 +87,26 @@ _TOPIC_MARKERS: list[tuple[str, str]] = [
     (r"\bFirst of all\b", "introduction"),
 ]
 
+# Connector words used as sentence boundaries in all-lowercase transcription text
+_TRANSCRIPTION_CONNECTORS: list[str] = [
+    "entonces",
+    "bueno",
+    " y ",
+    " pero ",
+    " porque ",
+    "además",
+    "también",
+    "ahora",
+    "después",
+    "así que",
+    "o sea",
+    "sin embargo",
+    "entonces a",
+    "y si",
+    "pero la",
+    "bueno ahora",
+]
+
 # Spanish filler words / muletillas
 _SPANISH_FILLERS: set[str] = {
     "bueno", "pues", "entonces", "digamos", "eh", "este", "esto",
@@ -313,7 +333,7 @@ class TextPreprocessor:
         return result
 
     def _split_by_themes_heuristic(self, text: str) -> list[dict[str, Any]]:
-        """Heuristic: blank lines, then topic markers."""
+        """Heuristic: blank lines, then topic markers, then sentence boundaries."""
         # 1. Split on blank lines (paragraphs)
         paragraphs = re.split(r"\n\s*\n", text)
         blocks: list[tuple[int, int]] = []
@@ -347,6 +367,15 @@ class TextPreprocessor:
                 )
             else:
                 final_segments.extend(sub_segments)
+
+        # 3. If few segments and text looks continuous (>1000 chars, <=2 blocks),
+        #    try sentence-boundary splitting
+        if len(final_segments) <= 2 and len(text) > 1000:
+            final_segments = self._split_on_sentences(text)
+
+        # 4. Force-split if still only 1 theme and text is long
+        if len(final_segments) <= 1 and len(text) > 2000:
+            final_segments = self._force_split_chunks(text, chunk_size=2000)
 
         return final_segments
 
@@ -428,6 +457,150 @@ class TextPreprocessor:
             return "explanation"
         return "general"
 
+    # ── Sentence-boundary splitting helpers ──────────────────────────
+
+    def _split_on_sentences(self, text: str) -> list[dict[str, Any]]:
+        """Split continuous text on sentence boundaries.
+
+        For normal text: split on .!? + space + capital letter.
+        For all-lowercase transcription text: split on connector words.
+        Then group into theme groups of ~500-1000 chars.
+        """
+        # Detect if text is mostly lowercase (transcription-style)
+        alpha_chars = sum(1 for c in text if c.isalpha())
+        upper_chars = sum(1 for c in text if c.isupper())
+        is_lowercase = (upper_chars / max(alpha_chars, 1)) < 0.05  # < 5% uppercase
+
+        if is_lowercase:
+            raw_sentences = self._split_lowercase_on_connectors(text)
+        else:
+            raw_sentences = self._split_on_punctuation(text)
+
+        # Group sentences into theme groups of ~500-1000 chars
+        groups = self._group_sentences(raw_sentences, min_size=500, max_size=1000)
+
+        result: list[dict[str, Any]] = []
+        cursor = 0
+        for group_text in groups:
+            idx = text.find(group_text, cursor)
+            if idx == -1:
+                idx = cursor  # fallback
+            start = idx
+            end = idx + len(group_text)
+            result.append({
+                "theme": self._guess_theme(group_text),
+                "text": group_text,
+                "start_char": start,
+                "end_char": end,
+            })
+            cursor = end
+
+        return result
+
+    @staticmethod
+    def _split_on_punctuation(text: str) -> list[str]:
+        """Split text on sentence-ending punctuation (.!?) followed by space + capital."""
+        parts = re.split(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÜÑ])', text)
+        return [p.strip() for p in parts if p.strip()]
+
+    @staticmethod
+    def _split_lowercase_on_connectors(text: str) -> list[str]:
+        """Split all-lowercase text on connector words as pseudo-sentence boundaries."""
+        # Build pattern from connectors, sorted by length (longest first)
+        connectors_sorted = sorted(
+            _TRANSCRIPTION_CONNECTORS, key=len, reverse=True
+        )
+        pattern = '|'.join(re.escape(c) for c in connectors_sorted)
+
+        # Split on connector words, keeping them as part of the following segment
+        parts = re.split(f'({pattern})', text)
+
+        sentences: list[str] = []
+        current = ""
+        for part in parts:
+            if part and re.match(f'^({pattern})$', part):
+                # This is a connector — start a new sentence
+                if current.strip():
+                    sentences.append(current.strip())
+                current = part
+            else:
+                current += part
+
+        if current.strip():
+            sentences.append(current.strip())
+
+        # Further split any very long sentences (>1500 chars)
+        result: list[str] = []
+        for s in sentences:
+            if len(s) > 1500:
+                words = s.split()
+                chunk = ""
+                for w in words:
+                    if len(chunk) + len(w) > 800:
+                        if chunk:
+                            result.append(chunk.strip())
+                        chunk = w
+                    else:
+                        chunk += " " + w if chunk else w
+                if chunk:
+                    result.append(chunk.strip())
+            else:
+                result.append(s)
+
+        return result
+
+    @staticmethod
+    def _group_sentences(
+        sentences: list[str], min_size: int, max_size: int
+    ) -> list[str]:
+        """Group sentences into chunks of approximately min_size to max_size chars."""
+        groups: list[str] = []
+        current = ""
+        for s in sentences:
+            if current and len(current) + len(s) + 1 > max_size:
+                groups.append(current)
+                current = s
+            else:
+                if current:
+                    current += " " + s
+                else:
+                    current = s
+
+        if current:
+            # If the last group is small, merge with previous
+            if groups and len(current) < min_size:
+                groups[-1] += " " + current
+            else:
+                groups.append(current)
+
+        return groups
+
+    @staticmethod
+    def _force_split_chunks(
+        text: str, chunk_size: int = 2000
+    ) -> list[dict[str, Any]]:
+        """Force-split text into chunks of approximately chunk_size chars."""
+        result: list[dict[str, Any]] = []
+        pos = 0
+        while pos < len(text):
+            end = min(pos + chunk_size, len(text))
+            # Try to break at a space near the end
+            if end < len(text):
+                space_pos = text.rfind(' ', pos, end)
+                if space_pos > pos + chunk_size // 2:
+                    end = space_pos
+            chunk = text[pos:end].strip()
+            if chunk:
+                theme = TextPreprocessor._guess_theme(chunk)
+                result.append({
+                    "theme": theme,
+                    "text": chunk,
+                    "start_char": pos,
+                    "end_char": end,
+                })
+            pos = end
+        return result
+
     # ------------------------------------------------------------------
     # 2. canonicalize
     # ------------------------------------------------------------------
@@ -488,8 +661,17 @@ class TextPreprocessor:
     # 3. estimate_complexity
     # ------------------------------------------------------------------
 
-    def estimate_complexity(self, text: str) -> dict[str, Any]:
+    def estimate_complexity(
+        self, text: str, entity_registry: Any = None
+    ) -> dict[str, Any]:
         """Estimate textual complexity via simple heuristics.
+
+        Parameters
+        ----------
+        text : str
+            Raw input text.
+        entity_registry : EntityRegistry or None
+            If provided, used to cross-check entity names against the registry.
 
         Returns
         -------
@@ -516,9 +698,22 @@ class TextPreprocessor:
         )
         emotional_density = min(1.0, emotional_count / total_words)
 
-        # Entity density (proper noun heuristic)
+        # Entity density — multiple strategies
+        entity_count = 0
+
+        # Strategy A: capitalized proper noun candidates (original heuristic)
         proper_candidates = _proper_noun_candidates(text)
-        entity_density = min(1.0, len(proper_candidates) / total_words)
+        entity_count += len(proper_candidates)
+
+        # Strategy B: for all-lowercase text, use Spanish preposition heuristic
+        if entity_count == 0:
+            entity_count += self._count_spanish_proper_nouns_heuristic(text)
+
+        # Strategy C: cross-check with registry if available
+        if entity_registry is not None:
+            entity_count += self._count_registry_entities(text, entity_registry)
+
+        entity_density = min(1.0, entity_count / total_words)
 
         return {
             "char_count": char_count,
@@ -526,3 +721,79 @@ class TextPreprocessor:
             "emotional_density": round(emotional_density, 4),
             "entity_density": round(entity_density, 4),
         }
+
+    # ── Entity density helpers ─────────────────────────────────────
+
+    @staticmethod
+    def _count_spanish_proper_nouns_heuristic(text: str) -> int:
+        """Count words after Spanish prepositions that look like proper names.
+
+        In lowercase Spanish text, proper names often follow prepositions like
+        'de', 'con', 'para', 'en'.  This heuristic counts the word immediately
+        after those prepositions, excluding very common Spanish words.
+        """
+        # Common Spanish words to exclude (not proper nouns)
+        _COMMON_SPANISH: set[str] = {
+            "una", "un", "los", "las", "el", "la", "que", "eso", "ese",
+            "esa", "todo", "toda", "todos", "todas", "muy", "más", "menos",
+            "cada", "otro", "otra", "otros", "otras", "este", "esta",
+            "mi", "tu", "su", "mis", "tus", "sus", "me", "te", "se",
+            "le", "les", "lo", "nos", "hay", "era", "son",
+            "fue", "han", "había", "ser", "estar", "puede", "hace",
+            "tiene", "dice", "forma", "parte", "manera", "tipo", "modo",
+            "caso", "lugar", "tiempo", "cosa", "cosas", "persona",
+            "vida", "mundo", "día", "año", "gente", "país", "trabajo",
+            "casa", "familia", "historia", "ejemplo", "razón", "hecho",
+            "punto", "cuestión", "tema", "problema", "sistema",
+            "porque", "cuando", "donde", "como", "entre", "hasta",
+            "desde", "sobre", "sin", "contra", "hacia", "durante",
+            "mucho", "poco", "bien", "mal", "mejor", "peor",
+            "gran", "grande", "pequeño", "nuevo", "viejo",
+            "bueno", "malo", "primero", "último", "mismo",
+            "importante", "necesario", "posible", "capaz",
+            "diferente", "único", "propio", "cierto", "tanto",
+            "algún", "algunos", "ningún", "ninguno", "cualquier",
+            "quiere", "pueden", "hacer", "tener", "decir", "saber",
+            "ver", "dar", "ir", "venir", "llegar", "poner",
+        }
+        prepositions = {"de", "con", "para", "en"}
+        count = 0
+        words = text.lower().split()
+        for i, word in enumerate(words):
+            if word in prepositions and i + 1 < len(words):
+                next_word = words[i + 1]
+                if (
+                    len(next_word) >= 3
+                    and next_word.isalpha()
+                    and next_word not in _COMMON_SPANISH
+                ):
+                    count += 1
+        return count
+
+    @staticmethod
+    def _count_registry_entities(text: str, registry: Any) -> int:
+        """Count how many known entity names from the registry appear in text."""
+        count = 0
+        lower_text = text.lower()
+        try:
+            # Try to get all active entity names
+            entities = registry.db.execute(
+                "SELECT canonical_name FROM entities WHERE status='active'"
+            ).fetchall()
+            for row in entities:
+                name = row[0]
+                if name.lower() in lower_text:
+                    count += 1
+            # Also check aliases
+            aliases = registry.db.execute(
+                "SELECT alias FROM aliases"
+            ).fetchall()
+            seen = set()
+            for row in aliases:
+                alias = row[0].lower()
+                if alias not in seen and alias in lower_text:
+                    seen.add(alias)
+                    count += 1
+        except Exception:
+            pass  # registry unavailable or misconfigured
+        return count

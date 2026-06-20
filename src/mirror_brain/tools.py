@@ -346,10 +346,10 @@ class SearchTools:
         like = f"%{query}%"
         try:
             rows = registry.db.execute(
-                "SELECT id, content, timestamp, source "
+                "SELECT uuid, content, created_at, source "
                 "FROM raw_texts "
                 "WHERE content LIKE ? "
-                "ORDER BY timestamp DESC "
+                "ORDER BY created_at DESC "
                 "LIMIT ?",
                 (like, limit),
             ).fetchall()
