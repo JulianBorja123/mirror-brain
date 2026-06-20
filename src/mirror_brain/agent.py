@@ -155,8 +155,11 @@ class MirrorBrainAgent:
         # 4. EXECUTE with confidence gates
         report = self._execute(decisions)
 
-        # 5. V3 POST-PROCESS: record procedural trace + auto-consolidate
+        # 5. V3 POST-PROCESS: record procedural trace + auto-consolidate + dedup
         self._post_process(report, decisions, text)
+        
+        # 5.5 DEDUP: merge fragmented entities post-execution
+        self._dedup_fragmented_entities(report)
 
         report["complexity"] = complexity
         report["theme_count"] = len(themes)
@@ -387,6 +390,16 @@ class MirrorBrainAgent:
             if not name:
                 continue
 
+            # Filter temporal/demonstrative words
+            STOP_ENTITY_WORDS = {
+                "hoy", "ayer", "mañana", "ahora", "esto", "este", "esta",
+                "ese", "esa", "eso", "aquel", "aquella", "ello",
+                "today", "yesterday", "tomorrow", "now", "this", "that",
+            }
+            if name.lower() in STOP_ENTITY_WORDS:
+                report["skipped"].append(f"entity: {name} (stop word)")
+                continue
+
             if conf >= 0.85:
                 if alias_of:
                     target = self.registry.resolve(alias_of)
@@ -446,6 +459,102 @@ class MirrorBrainAgent:
         report["stats"] = {"entities": n_ent, "relations": n_rel}
         return report
 
+    # ── Dedup Fragmented Entities ───────────────────────────
+
+    def _dedup_fragmented_entities(self, report: dict):
+        """Post-process: detect and merge entity name variants.
+
+        Scans recently created entities for names that are likely
+        variations of the same thing (different capitalization, accents,
+        partial name matches). Auto-merges when confidence is high.
+
+        Examples:
+        - "Julián" + "Gustavo Julian Barrios Borja" → alias link
+        - "Romina" + "Romina Gonzalez" → alias link
+        - "Romina Gonzalez" + "Romina González" → alias link (accent diff)
+        """
+        import unicodedata
+
+        try:
+            rows = self.registry.db.execute(
+                "SELECT uuid, canonical_name FROM entities WHERE status='active' ORDER BY created_at DESC LIMIT 50"
+            ).fetchall()
+        except Exception:
+            return
+
+        # Normalize helper
+        def _norm(s: str) -> str:
+            nfkd = unicodedata.normalize("NFKD", s.lower().strip())
+            return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
+
+        # Build normalized index
+        norm_index: dict[str, list[tuple[str, str]]] = {}  # norm_name → [(uuid, canonical_name)]
+        for uuid_, name in rows:
+            n = _norm(name)
+            if n not in norm_index:
+                norm_index[n] = []
+            norm_index[n].append((uuid_, name))
+
+        merged = 0
+
+        # Check each entity against others for substring/partial matches
+        entities_list = [(u, n) for u, n in rows]
+        for i, (uuid_a, name_a) in enumerate(entities_list):
+            norm_a = _norm(name_a)
+            for j, (uuid_b, name_b) in enumerate(entities_list):
+                if i >= j:
+                    continue
+                if uuid_a == uuid_b:
+                    continue
+
+                norm_b = _norm(name_b)
+                # Skip if already same after normalization (exact match)
+                if norm_a == norm_b:
+                    # Same normalized name → merge as alias
+                    try:
+                        # Check if alias already exists
+                        existing = self.registry.db.execute(
+                            "SELECT 1 FROM aliases WHERE alias=? AND entity_uuid=?",
+                            (name_b, uuid_a)
+                        ).fetchone()
+                        if not existing:
+                            self.registry.add_alias(name_b, uuid_a, source="dedup", confidence=0.95)
+                            merged += 1
+                    except Exception:
+                        pass
+                    continue
+
+                # Check if one name contains the other (substring match)
+                words_a = set(norm_a.split())
+                words_b = set(norm_b.split())
+
+                # If all words of shorter name are in longer name → likely same entity
+                if len(words_a) <= len(words_b):
+                    shorter, longer = words_a, words_b
+                    shorter_uuid, longer_uuid = uuid_a, uuid_b
+                    shorter_name, longer_name = name_a, name_b
+                else:
+                    shorter, longer = words_b, words_a
+                    shorter_uuid, longer_uuid = uuid_b, uuid_a
+                    shorter_name, longer_name = name_b, name_a
+
+                # At least 2 words and all shorter words present in longer
+                if len(shorter) >= 1 and shorter.issubset(longer) and len(shorter) < len(longer):
+                    try:
+                        existing = self.registry.db.execute(
+                            "SELECT 1 FROM aliases WHERE alias=? AND entity_uuid=?",
+                            (shorter_name, longer_uuid)
+                        ).fetchone()
+                        if not existing:
+                            self.registry.add_alias(shorter_name, longer_uuid, source="dedup", confidence=0.90)
+                            merged += 1
+                    except Exception:
+                        pass
+
+        if merged > 0:
+            report.setdefault("dedup_merges", 0)
+            report["dedup_merges"] = merged
+
     # ── V3 Post-Process ──────────────────────────────────────
 
     def _post_process(self, report: dict, decisions: dict, text: str):
@@ -488,16 +597,27 @@ class MirrorBrainAgent:
 
     def _extract_potential_entities(self, themes: list) -> list[str]:
         """Extract potential entity names from text using simple heuristics."""
+        # Words that should NEVER be entities
+        STOP_WORDS = {
+            "hoy", "ayer", "mañana", "ahora", "esto", "este", "esta",
+            "ese", "esa", "eso", "aquel", "aquella", "ello", "aqui", "allí", "allá",
+            "hoy", "today", "yesterday", "tomorrow", "now", "this", "that",
+            "día", "day", "año", "year", "mes", "month", "semana", "week",
+            "vez", "time", "parte", "part", "manera", "way", "forma",
+            "cosa", "thing", "lado", "side", "tipo", "type",
+        }
         names = set()
         for theme in themes:
             text = theme.get("text", "")
             for match in re.finditer(r'\b[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,}(?:\s+[A-ZÁÉÍÓÚÑ][a-záéíóúñ]{2,})?\b', text):
-                names.add(match.group(0))
+                name = match.group(0)
+                if name.lower() not in STOP_WORDS:
+                    names.add(name)
             try:
                 rows = self.registry.db.execute("SELECT canonical_name FROM entities WHERE status='active'").fetchall()
                 lower_text = text.lower()
                 for (name,) in rows:
-                    if name.lower() in lower_text:
+                    if name.lower() in lower_text and name.lower() not in STOP_WORDS:
                         names.add(name)
             except Exception:
                 pass

@@ -163,10 +163,10 @@ class SearchTools:
         name: str,
         max_distance: int = 3,
     ) -> list[dict]:
-        """LIKE-based search across canonical names and aliases.
+        """LIKE-based + non-contiguous word search across canonical names and aliases.
 
-        *max_distance* is advisory metadata included in the result —
-        the actual search uses SQL LIKE.
+        Falls back to multi-word non-contiguous matching when LIKE returns
+        no results (e.g., \"Gustavo Barrios\" matching \"Gustavo Julian Barrios Borja\")."
         """
         like = f"%{name}%"
         try:
@@ -182,6 +182,36 @@ class SearchTools:
             ).fetchall()
         except Exception:
             return []
+
+        # If LIKE found nothing, try non-contiguous word matching
+        if not rows:
+            words = name.lower().split()
+            if len(words) >= 2:
+                try:
+                    # Fetch all candidate rows and filter in Python
+                    all_rows = registry.db.execute(
+                        "SELECT DISTINCT e.uuid, e.canonical_name, e.type, e.status "
+                        "FROM entities e "
+                        "LEFT JOIN aliases a ON e.uuid = a.entity_uuid "
+                        "WHERE e.canonical_name LIKE ? OR e.canonical_name LIKE ? "
+                        "   OR a.alias LIKE ? OR a.alias LIKE ? "
+                        "ORDER BY e.canonical_name LIMIT 100",
+                        (f"%{words[0]}%", f"%{words[-1]}%", f"%{words[0]}%", f"%{words[-1]}%"),
+                    ).fetchall()
+                    # Filter: all words must appear (non-contiguously)
+                    for row in all_rows:
+                        canon_lower = row[1].lower()
+                        # Also check aliases
+                        alias_rows = registry.db.execute(
+                            "SELECT alias FROM aliases WHERE entity_uuid=?", (row[0],)
+                        ).fetchall()
+                        aliases_lower = [a[0].lower() for a in alias_rows]
+                        search_in = [canon_lower] + aliases_lower
+                        if any(all(w in s for w in words) for s in search_in):
+                            if row not in rows:
+                                rows.append(row)
+                except Exception:
+                    pass
 
         if not rows:
             return []
