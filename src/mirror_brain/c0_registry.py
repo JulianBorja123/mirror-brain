@@ -21,7 +21,8 @@ class C0Registry:
         self.c0 = c0_client
         self.db = self  # Compatibility shim for modules that access registry.db
         # In-memory caches for fast lookups (c0 search is the source of truth)
-        self._alias_cache: dict[str, str] = {}  # alias → uuid
+        self._alias_cache: dict[str, str] = {}  # alias_lower → uuid
+        self._name_cache: dict[str, str] = {}   # uuid → canonical_name
 
     def ensure_ready(self):
         """Verify c0 is available."""
@@ -45,8 +46,9 @@ class C0Registry:
         desc = f"type={type_}"
         self.c0.create_concept(name, description=desc)
 
-        # Cache the alias
+        # Cache the alias and canonical name
         self._alias_cache[name.lower()] = entity_uuid
+        self._name_cache[entity_uuid] = name
 
         return entity_uuid, c0_ref
 
@@ -237,10 +239,19 @@ class C0Registry:
 
     def _uuid_to_name(self, entity_uuid: str) -> Optional[str]:
         """Reverse-lookup: find canonical name from UUID."""
-        for alias, uid in self._alias_cache.items():
+        # First check canonical name cache
+        if entity_uuid in self._name_cache:
+            return self._name_cache[entity_uuid]
+        # Fallback: search alias cache
+        for alias_lower, uid in self._alias_cache.items():
             if uid == entity_uuid:
-                # Return the first one we cached; prefer the longest (canonical)
-                return alias
+                # Try to recover original case from c0
+                results = self.c0.search(alias_lower, limit=1, keyword_only=True)
+                if results:
+                    name = results[0].get("name", alias_lower)
+                    self._name_cache[entity_uuid] = name
+                    return name
+                return alias_lower
         return None
 
     @staticmethod

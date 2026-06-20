@@ -279,48 +279,61 @@ class C0Client:
 
     @staticmethod
     def _parse_walk_output(output: str) -> dict:
-        """Parse c0 walk text output into structured dict."""
+        """Parse c0 walk text output into structured dict.
+
+        c0 walk format:
+            Walking from 'Name' (depth N):
+              -> ConnectedName (score%)
+            [c0: Xms]
+        Or with patches:
+            (fulltext: 'query' -> 'Name' [score: X])
+            KNOWLEDGE PATCH:
+            ---
+            [patch content]
+            CONNECTED:
+            ...
+        """
         result: dict = {"start": "", "patches": [], "connected": [], "hybrid_hint": ""}
         if not output:
             return result
 
-        section = None
         for line in output.split("\n"):
             stripped = line.strip()
-            if not stripped:
+            if not stripped or stripped.startswith("[c0:"):
                 continue
 
-            # Detect hybrid hint: (hybrid: 'query' -> 'name' [rrf: score])
+            # Hybrid/fulltext hint
             if stripped.startswith("(hybrid:") or stripped.startswith("(fulltext:"):
                 result["hybrid_hint"] = stripped
-                # Extract resolved concept name
                 if "-> '" in stripped:
                     result["start"] = stripped.split("-> '")[1].split("'")[0]
                 continue
 
-            # Section headers
+            # "Walking from 'Name' (depth N):" → start
+            if stripped.startswith("Walking from '"):
+                name_part = stripped.split("'")[1] if "'" in stripped else ""
+                result["start"] = name_part
+                continue
+
+            # "-> Name (score%)" or "  -> Name"  → connected
+            if stripped.startswith("-> "):
+                name = stripped[3:].split(" (")[0].strip()
+                result["connected"].append(name)
+                continue
+
+            # Section headers (legacy format)
             if stripped == "KNOWLEDGE PATCH:":
-                section = "patches"
                 continue
-            elif stripped.startswith("CONNECTED"):
-                section = "connected"
+            elif stripped == "CONNECTED:":
                 continue
-            elif stripped == "---":
+            elif stripped in ("---", "DEAD_END:walk:" + result.get("start", ""),
+                              "No connections from"):
                 continue
 
-            # Content lines
-            if section == "patches":
-                result["patches"].append(stripped)
-            elif section == "connected":
-                result["connected"].append(stripped)
-
-        # If no hybrid hint, start is first patch reference or unknown
-        if not result["start"] and result["patches"]:
-            first = result["patches"][0]
-            if first.startswith("["):
-                result["start"] = first.strip("[]")
-        elif not result["start"]:
-            result["start"] = "unknown"
+            # Catch-all for unclassified lines
+            if result.get("start") and stripped:
+                # Could be patch or connected content
+                pass
 
         return result
 
