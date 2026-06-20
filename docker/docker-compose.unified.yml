@@ -1,0 +1,144 @@
+# =============================================================================
+# Mirror Brain v1.0 — Unified Docker Compose Stack
+# =============================================================================
+# All four services share the 'mirrorbrain' bridge network so they can
+# resolve each other by service name (neo4j, ollama, c0, app).
+# =============================================================================
+
+version: "3.8"
+
+# -----------------------------------------------------------------------------
+# Networks
+# -----------------------------------------------------------------------------
+networks:
+  mirrorbrain:
+    driver: bridge
+
+# -----------------------------------------------------------------------------
+# Volumes (for persistent data across container restarts)
+# -----------------------------------------------------------------------------
+volumes:
+  neo4j-data:
+  ollama-models:
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+services:
+
+  # ===========================================================================
+  # 1. Neo4j — Graph database (Enterprise edition)
+  # ===========================================================================
+  neo4j:
+    image: neo4j:5-enterprise
+    container_name: mirrorbrain-neo4j
+    ports:
+      - "7687:7687"   # Bolt protocol (app/driver connections)
+      - "7474:7474"   # HTTP (Neo4j Browser UI)
+    environment:
+      NEO4J_AUTH: "neo4j/password"
+    volumes:
+      - neo4j-data:/data   # Persist graph data across restarts
+    networks:
+      - mirrorbrain
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ===========================================================================
+  # 2. Ollama — Local LLM inference server (CPU-only for Docker Desktop)
+  # ===========================================================================
+  ollama:
+    image: ollama/ollama
+    container_name: mirrorbrain-ollama
+    ports:
+      - "11434:11434"   # Ollama API endpoint
+    environment:
+      OLLAMA_HOST: "0.0.0.0"           # Listen on all interfaces inside container
+      OLLAMA_NUM_PARALLEL: "4"         # Allow parallel requests
+      OLLAMA_KEEP_ALIVE: "-1"          # Keep models loaded in memory
+    volumes:
+      - ollama-models:/root/.ollama    # Persist pulled models across restarts
+    networks:
+      - mirrorbrain
+    # No GPU — CPU-only for Windows Docker Desktop compatibility.
+    # To enable GPU passthrough on Linux, uncomment the following:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # ===========================================================================
+  # 3. c0 — Mirror Brain CLI bridge (namespace: mirrorbrain)
+  # ===========================================================================
+  c0:
+    image: debian:bookworm-slim   # Minimal Linux base; c0 binary is Linux ELF
+    container_name: mirrorbrain-c0
+    depends_on:
+      neo4j:
+        condition: service_healthy   # Wait for Neo4j to be fully ready
+      ollama:
+        condition: service_started
+    environment:
+      C0_NEO4J_URI: "neo4j://neo4j:7687"
+      C0_OLLAMA_HOST: "ollama:11434"
+    volumes:
+      # Mount the pre-built c0 Linux binary into the container
+      - /c/Users/gusta/c0/target/release/c0:/usr/local/bin/c0:ro
+    networks:
+      - mirrorbrain
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        set -e
+        echo "[c0] Waiting for Neo4j connectivity..."
+        # Simple retry loop until cypher-shell works (Bolt port 7687 reachable)
+        until nc -z neo4j 7687 2>/dev/null; do
+          echo "[c0] Neo4j not ready yet — retrying in 3s..."
+          sleep 3
+        done
+        echo "[c0] Neo4j is reachable. Initialising namespace 'mirrorbrain'..."
+        c0 init mirrorbrain || echo "[c0] init returned non-zero (may already exist)"
+        echo "[c0] Initialisation complete. Keeping container alive for dev use..."
+        tail -f /dev/null
+
+  # ===========================================================================
+  # 4. app — Python 3.11 development container (stdlib only, no pip)
+  # ===========================================================================
+  app:
+    image: python:3.11-slim
+    container_name: mirrorbrain-app
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      c0:
+        condition: service_started
+    volumes:
+      # Mount Mirror Brain source code for live development
+      - /c/Users/gusta/mirror-brain/src:/app/src:ro
+    networks:
+      - mirrorbrain
+    working_dir: /app
+    environment:
+      PYTHONPATH: "/app/src"
+      C0_NEO4J_URI: "neo4j://neo4j:7687"
+      C0_OLLAMA_HOST: "ollama:11434"
+    # Keep container alive for development (drop into a shell, run scripts, etc.)
+    entrypoint:
+      - /bin/bash
+      - -c
+      - |
+        echo "[app] Mirror Brain dev container ready."
+        echo "[app] Source mounted at /app/src"
+        echo "[app] Neo4j: neo4j://neo4j:7687  |  Ollama: ollama:11434"
+        echo "[app] Use 'docker exec -it mirrorbrain-app bash' to interact."
+        tail -f /dev/null
