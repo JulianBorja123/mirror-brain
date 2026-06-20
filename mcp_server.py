@@ -20,7 +20,8 @@ _args = _parser.parse_args()
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
 
 from mcp.server import FastMCP
-from mirror_brain.registry import EntityRegistry
+from mirror_brain.c0_client import C0Client
+from mirror_brain.c0_registry import C0Registry
 from mirror_brain.tools import SearchTools
 from mirror_brain.agent import MirrorBrainAgent
 from mirror_brain.procedural import ProceduralMemory
@@ -35,7 +36,8 @@ from mirror_brain.skills import SkillManager
 # Globals (set during startup)
 # ═══════════════════════════════════════════════════════════════
 
-_registry: EntityRegistry | None = None
+_c0: C0Client | None = None
+_registry: C0Registry | None = None
 _tools: SearchTools | None = None
 _agent: MirrorBrainAgent | None = None
 _procedural: ProceduralMemory | None = None
@@ -84,7 +86,7 @@ def mb_ingest(text: str, source: str = "mcp") -> str:
 def mb_search_semantic(query: str, limit: int = 10) -> str:
     """Hybrid semantic search via c0 (exact → keyword → vector RRF).
     Returns empty if c0 is not running."""
-    results = _tools.search_semantic(_registry, None, query, limit)
+    results = _tools.search_semantic(_registry, _c0, query, limit)
     return json.dumps(results, ensure_ascii=False, default=str)
 
 
@@ -401,12 +403,14 @@ def _deepseek_llm(prompt: str) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-# ── Init registry and modules ────────────────────────────────
+# ── Init registry and modules (c0-backed) ────────────────────
 
-_registry = EntityRegistry(_args.db)
+_c0 = C0Client(namespace="mirrorbrain")
+_registry = C0Registry(_c0)
 
 # Seed if empty
-n = sum(1 for _ in _registry.db.execute("SELECT 1 FROM entities"))
+all_e = _registry.get_all_entities()
+n = len(all_e)
 if n == 0:
     print(f"[MB-MCP] Seeding initial entities...")
     _registry.create("Gustavo Julian Barrios Borja", "person")
@@ -420,6 +424,7 @@ if n == 0:
     _registry.create("Docker", "tool")
     _registry.create("Ollama", "tool")
     _registry.create("Neo4j", "tool")
+    n = 9
 
 _tools = SearchTools()
 _procedural = ProceduralMemory(_registry)
@@ -432,6 +437,7 @@ _skills = SkillManager(_registry)
 _agent = MirrorBrainAgent(
     _registry,
     llm_call=_deepseek_llm,
+    c0_client=_c0,
     max_loops=3,
     procedural=_procedural,
     consolidation=_consolidation,
@@ -440,8 +446,12 @@ _agent = MirrorBrainAgent(
 )
 
 print(f"[MB-MCP] Mirror Brain v3 MCP Server starting on {_args.host}:{_args.port}")
-print(f"[MB-MCP] DB: {_args.db} | Entities: {n if n else 9} | Tools: 15 + agent pipeline")
-print(f"[MB-MCP] Memory budget: {_consolidation.get_memory_budget()}")
+print(f"[MB-MCP] Backend: c0 (Neo4j+Ollama) | Entities: {n} | Tools: 15 + agent pipeline")
+try:
+    budget = _consolidation.get_memory_budget()
+    print(f"[MB-MCP] Memory budget: {budget}")
+except Exception:
+    print(f"[MB-MCP] Memory budget: c0 mode (consolidation uses c0 graph)")
 
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")

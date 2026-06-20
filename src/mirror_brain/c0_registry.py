@@ -145,15 +145,13 @@ class C0Registry:
             return []
         walk_result = self.c0.walk(name, depth=1)
         relations = []
-        for line in walk_result.get("connected", []):
-            if " -> " in line:
-                target = line.split(" -> ")[-1].strip()
-                relations.append({
-                    "from_uuid": entity_uuid,
-                    "to_uuid": self._name_to_uuid(target),
-                    "relation_type": "related_to",
-                    "source_text": "",
-                })
+        for connected_name in walk_result.get("connected", []):
+            relations.append({
+                "from_uuid": entity_uuid,
+                "to_uuid": self._name_to_uuid(connected_name),
+                "relation_type": "related_to",
+                "source_text": "",
+            })
         return relations
 
     def search_relations(
