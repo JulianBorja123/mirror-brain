@@ -79,7 +79,7 @@ services:
   # 3. c0 — Mirror Brain CLI bridge (namespace: mirrorbrain)
   # ===========================================================================
   c0:
-    image: debian:bookworm-slim   # Minimal Linux base; c0 binary is Linux ELF
+    image: debian:trixie-slim   # Trixie has GLIBC 2.39 needed by nightly-compiled c0
     container_name: mirrorbrain-c0
     depends_on:
       neo4j:
@@ -87,11 +87,15 @@ services:
       ollama:
         condition: service_started
     environment:
-      C0_NEO4J_URI: "neo4j://neo4j:7687"
-      C0_OLLAMA_HOST: "ollama:11434"
+      NEO4J_URI: "bolt://neo4j:7687"
+      NEO4J_USER: "neo4j"
+      NEO4J_PASSWORD: "password"
+      C0_OLLAMA_HOST: "http://ollama:11434"
     volumes:
       # Mount the pre-built c0 Linux binary into the container
-      - /c/Users/gusta/c0/target/release/c0:/usr/local/bin/c0:ro
+      - /c/Users/gusta/c0/c0-linux:/usr/local/bin/c0:ro
+      # Mount c0 config with correct Ollama host (global config in home dir)
+      - /c/Users/gusta/mirror-brain/docker/c0-config.toml:/root/.c0/config.toml:ro
     networks:
       - mirrorbrain
     entrypoint:
@@ -100,7 +104,7 @@ services:
       - |
         set -e
         echo "[c0] Installing prerequisites..."
-        apt-get update -qq && apt-get install -y -qq netcat-openbsd 2>&1 | tail -1
+        apt-get update -qq && apt-get install -y -qq netcat-openbsd libssl3 2>&1 | tail -1
         echo "[c0] Waiting for Neo4j connectivity..."
         # Simple retry loop until Bolt port 7687 is reachable
         until nc -z neo4j 7687 2>/dev/null; do
@@ -108,7 +112,7 @@ services:
           sleep 3
         done
         echo "[c0] Neo4j is reachable. Initialising namespace 'mirrorbrain'..."
-        c0 init mirrorbrain || echo "[c0] init returned non-zero (may already exist)"
+        c0 init --namespace mirrorbrain || echo "[c0] init returned non-zero (may already exist)"
         echo "[c0] Initialisation complete. Keeping container alive for dev use..."
         tail -f /dev/null
 

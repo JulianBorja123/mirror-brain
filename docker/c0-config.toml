@@ -1,0 +1,8 @@
+namespace = "mirrorbrain"
+inherit_global = true
+
+[ollama]
+host = "http://ollama:11434"
+
+[semantic]
+enabled = true
