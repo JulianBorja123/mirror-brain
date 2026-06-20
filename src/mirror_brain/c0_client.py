@@ -63,11 +63,12 @@ class C0Client:
         description: str = "",
         source: str = "",
         valid_at: str = "",
-        force: bool = False,
+        force: bool = True,
     ) -> str:
         """Create a concept node. Returns the canonical name on success.
 
-        Uses: ``c0 add concept <name> [--description ...] [--source ...]``
+        Uses: ``c0 add concept <name> [--description ...] --force``
+        Force flag bypasses c0's similarity guard (we handle dedup ourselves).
         """
         args = ["add", "concept", name]
         if description:
@@ -215,21 +216,36 @@ class C0Client:
     # ── Listing ───────────────────────────────────────────────────
 
     def list_concepts(self, namespace: str = "", limit: int = 100) -> list[dict]:
-        """List concepts in a namespace.
+        """List concepts via c0 export (dumps full graph as JSON).
 
-        Uses: ``c0 list concepts`` (with optional namespace via config).
+        Uses: ``c0 export --format json``
+        c0 fulltext search requires word-level matches, so we export and filter.
         """
-        # c0 list concepts returns tabular text
-        output = self._docker_exec("list", "concepts")
+        output = self._docker_exec("export", "--format", "json")
         if not output:
             return []
-        results = []
-        for line in output.split("\n"):
-            line = line.strip()
-            if not line or line.startswith("─") or line.startswith("name"):
-                continue
-            results.append({"raw": line})
-        return results[:limit]
+        try:
+            data = json.loads(output)
+            nodes = data.get("nodes", []) if isinstance(data, dict) else []
+            results = []
+            for node in nodes:
+                props = node.get("properties", {})
+                name = props.get("name", "")
+                if not name:
+                    continue
+                # Filter by namespace if specified
+                labels = node.get("labels", [])
+                if namespace and namespace not in labels:
+                    continue
+                results.append({
+                    "name": name,
+                    "namespace": next((l for l in labels if l != "Concept"), ""),
+                    "description": props.get("description", ""),
+                    "similarity": 1.0,
+                })
+            return results[:limit]
+        except json.JSONDecodeError:
+            return []
 
     # ── Internals ─────────────────────────────────────────────────
 
