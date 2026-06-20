@@ -147,14 +147,15 @@ class ProceduralMemory:
 
         try:
             existing = self.db.execute(
-                "SELECT id FROM procedures WHERE name = ?", (name,)
+                "SELECT name FROM procedures WHERE name = ?", (name,)
             ).fetchone()
 
             if existing:
                 self.db.execute(
                     "UPDATE procedures SET steps = ?, context = ?, "
+                    "success_count = ?, fail_count = ?, "
                     "last_used = ? WHERE name = ?",
-                    (steps_json, context, now, name),
+                    (steps_json, context, 0, 0, now, name),
                 )
                 self.db.commit()
                 return {"name": name, "created": False, "status": "updated"}
@@ -163,8 +164,8 @@ class ProceduralMemory:
                     "INSERT INTO procedures "
                     "(name, steps, context, success_count, fail_count, "
                     " last_used, created_at) "
-                    "VALUES (?, ?, ?, 0, 0, ?, ?)",
-                    (name, steps_json, context, now, now),
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, steps_json, context, 0, 0, now, now),
                 )
                 self.db.commit()
                 return {"name": name, "created": True, "status": "created"}
@@ -213,12 +214,16 @@ class ProceduralMemory:
         lower_ctx = current_context.lower()
         scored: list[dict] = []
 
-        for name, steps_json, ctx, succ, fail, last_used in rows:
-            # Decode steps
-            try:
-                steps = json.loads(steps_json) if steps_json else []
-            except (json.JSONDecodeError, TypeError):
-                steps = []
+        for name, steps_raw, ctx, succ, fail, last_used in rows:
+            # _fetch_module_rows returns steps already parsed from JSON,
+            # but direct SQLite would return a JSON string. Handle both.
+            if isinstance(steps_raw, list):
+                steps = steps_raw
+            else:
+                try:
+                    steps = json.loads(steps_raw) if steps_raw else []
+                except (json.JSONDecodeError, TypeError):
+                    steps = []
 
             # Build combined text for fuzzy comparison
             combined = f"{ctx or ''} {' '.join(steps)}".lower()
@@ -337,11 +342,15 @@ class ProceduralMemory:
                 best_match: Optional[str] = None
                 best_score = 0.0
 
-                for pname, steps_json in proc_rows:
-                    try:
-                        psteps = json.loads(steps_json) if steps_json else []
-                    except (json.JSONDecodeError, TypeError):
-                        psteps = []
+                for pname, steps_raw in proc_rows:
+                    # Handle both parsed list (from FakeCursor) and JSON string (from SQLite)
+                    if isinstance(steps_raw, list):
+                        psteps = steps_raw
+                    else:
+                        try:
+                            psteps = json.loads(steps_raw) if steps_raw else []
+                        except (json.JSONDecodeError, TypeError):
+                            psteps = []
                     if not psteps:
                         continue
 
@@ -357,18 +366,29 @@ class ProceduralMemory:
                         best_match = pname
 
                 if best_match:
+                    # Get current counters
+                    try:
+                        proc_row = self.db.execute(
+                            "SELECT success_count, fail_count FROM procedures WHERE name = ?",
+                            (best_match,)
+                        ).fetchone()
+                        if proc_row:
+                            succ, fail = int(proc_row[0] or 0), int(proc_row[1] or 0)
+                        else:
+                            succ, fail = 0, 0
+                    except Exception:
+                        succ, fail = 0, 0
+
                     if outcome == "success":
-                        self.db.execute(
-                            "UPDATE procedures SET success_count = success_count + 1, "
-                            "last_used = ? WHERE name = ?",
-                            (now, best_match),
-                        )
+                        succ += 1
                     else:
-                        self.db.execute(
-                            "UPDATE procedures SET fail_count = fail_count + 1, "
-                            "last_used = ? WHERE name = ?",
-                            (now, best_match),
-                        )
+                        fail += 1
+
+                    self.db.execute(
+                        "UPDATE procedures SET success_count = ?, fail_count = ?, "
+                        "last_used = ? WHERE name = ?",
+                        (succ, fail, now, best_match),
+                    )
             except Exception:
                 pass  # counter update is best-effort; trace is already saved
 

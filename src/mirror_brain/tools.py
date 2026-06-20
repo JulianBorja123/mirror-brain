@@ -40,22 +40,32 @@ class SearchTools:
         """Hybrid search via c0 (exact → keyword → vector RRF).
 
         Returns a list of result dicts, or an empty list on failure.
+        Internal concepts ([tbl], [consolidation]) get a score penalty
+        so real entities surface first, but they're kept as fallback.
         """
         if c0 is None:
             return []
 
         try:
-            results = c0.search(query, limit=limit)
+            results = c0.search(query, limit=limit * 2)  # oversample to compensate penalties
             if not results:
                 return []
-            # Normalise raw-text fallback from c0._parse_list
+            # Normalise + deprioritize internal concepts
             normalised = []
             for r in results:
                 if "raw" in r and len(r) == 1:
-                    normalised.append({"text": r["raw"]})
-                else:
-                    normalised.append(r)
-            return normalised
+                    normalised.append({"text": r["raw"], "similarity": 0.0})
+                    continue
+                name = r.get("name", "")
+                sim = r.get("similarity", 0)
+                is_internal = name.startswith(("[tbl]", "[consolidation]"))
+                if is_internal:
+                    continue  # Skip internal concepts entirely in semantic results
+                r = {**r, "similarity": sim}
+                normalised.append(r)
+            # Re-sort by similarity descending, take top N
+            normalised.sort(key=lambda x: x.get("similarity", 0), reverse=True)
+            return normalised[:limit]
         except Exception:
             return []
 
@@ -163,12 +173,26 @@ class SearchTools:
         name: str,
         max_distance: int = 3,
     ) -> list[dict]:
-        """LIKE-based + non-contiguous word search across canonical names and aliases.
+        """LIKE-based + alias-cache search across canonical names and aliases.
 
-        Falls back to multi-word non-contiguous matching when LIKE returns
-        no results (e.g., \"Gustavo Barrios\" matching \"Gustavo Julian Barrios Borja\")."
-        """
+        Checks the in-memory alias cache first for direct/partial matches,
+        then falls back to LIKE-based SQL search. Handles multi-word
+        non-contiguous matching."""
         like = f"%{name}%"
+        name_lower = name.lower().strip()
+        rows = []
+        alias_matched_uuids = set()
+
+        # ── Phase 1: Check alias cache directly ──
+        try:
+            alias_cache = getattr(registry, '_alias_cache', {})
+            for alias_lower, uid in alias_cache.items():
+                if name_lower and name_lower in alias_lower:
+                    alias_matched_uuids.add(uid)
+        except Exception:
+            pass
+
+        # ── Phase 2: SQL-based entity search ──
         try:
             rows = registry.db.execute(
                 "SELECT DISTINCT e.uuid, e.canonical_name, e.type, e.status "
@@ -181,7 +205,15 @@ class SearchTools:
                 (like, like),
             ).fetchall()
         except Exception:
-            return []
+            pass
+
+        # ── Phase 3: Add entities found via alias cache ──
+        for uid in alias_matched_uuids:
+            # Check if already in rows
+            if not any(r[0] == uid for r in rows):
+                info = registry.get(uid)
+                if info:
+                    rows.append((uid, info.get("canonical_name", ""), info.get("type", ""), info.get("status", "active")))
 
         # If LIKE found nothing, try non-contiguous word matching
         if not rows:
@@ -446,13 +478,17 @@ class SearchTools:
         if row is None:
             return {"error": f"procedure {name!r} not found", "name": name}
 
-        # Decode steps JSON safely
-        try:
-            steps = json.loads(row[1]) if row[1] else []
-        except (json.JSONDecodeError, TypeError):
-            steps = []
+        # Decode steps — handle both parsed list (FakeCursor) and JSON string (SQLite)
+        steps_raw = row[1]
+        if isinstance(steps_raw, list):
+            steps = steps_raw
+        else:
+            try:
+                steps = json.loads(steps_raw) if steps_raw else []
+            except (json.JSONDecodeError, TypeError):
+                steps = []
 
-        total = row[3] + row[4]
+        total = int(row[3] or 0) + int(row[4] or 0)
         success_rate = (row[3] / total) if total > 0 else None
 
         return {

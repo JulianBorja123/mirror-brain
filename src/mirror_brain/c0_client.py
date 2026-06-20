@@ -37,6 +37,7 @@ class C0Client:
         self.namespace = namespace
         self.container = container
         self._checked = False
+        self._export_cache: tuple[float, list[dict]] = (0, [])  # (expiry_ts, data)
 
     # ── Health ────────────────────────────────────────────────────
 
@@ -216,11 +217,19 @@ class C0Client:
     # ── Listing ───────────────────────────────────────────────────
 
     def list_concepts(self, namespace: str = "", limit: int = 100) -> list[dict]:
-        """List concepts via c0 export (dumps full graph as JSON).
+        """List concepts via c0 export (dumps full graph as JSON). Cached 60s.
 
         Uses: ``c0 export --format json``
         c0 fulltext search requires word-level matches, so we export and filter.
         """
+        # Check cache
+        now = time.time()
+        if self._export_cache[0] > now:
+            results = self._export_cache[1]
+            if namespace:
+                results = [r for r in results if r.get("namespace") == namespace]
+            return results[:limit]
+
         output = self._docker_exec("export", "--format", "json")
         if not output:
             return []
@@ -233,19 +242,25 @@ class C0Client:
                 name = props.get("name", "")
                 if not name:
                     continue
-                # Filter by namespace if specified
                 labels = node.get("labels", [])
-                if namespace and namespace not in labels:
-                    continue
+                ns = props.get("namespace", "") or next((l for l in labels if l != "Concept"), "")
                 results.append({
                     "name": name,
-                    "namespace": next((l for l in labels if l != "Concept"), ""),
+                    "namespace": ns,
                     "description": props.get("description", ""),
                     "similarity": 1.0,
                 })
+            # Cache full result for 60s
+            self._export_cache = (now + 60, results)
+            if namespace:
+                results = [r for r in results if r.get("namespace") == namespace]
             return results[:limit]
         except json.JSONDecodeError:
             return []
+
+    def invalidate_export_cache(self):
+        """Force next list_concepts() to re-fetch from c0."""
+        self._export_cache = (0, [])
 
     # ── Internals ─────────────────────────────────────────────────
 

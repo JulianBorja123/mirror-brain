@@ -1,0 +1,1 @@
+{"ts": "2026-06-20T19:17:16.267321+00:00", "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "mirror-brain-test-harness", "version": "1.0"}}, "elapsed_ms": 2026.12, "ok": false, "error": "<urlopen error [WinError 10061] No connection could be made because the target machine actively refused it>", "result_preview": null}

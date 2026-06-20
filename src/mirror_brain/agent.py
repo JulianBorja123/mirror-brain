@@ -400,7 +400,7 @@ class MirrorBrainAgent:
                 report["skipped"].append(f"entity: {name} (stop word)")
                 continue
 
-            if conf >= 0.85:
+            if conf >= 0.65:
                 if alias_of:
                     target = self.registry.resolve(alias_of)
                     if not target:
@@ -423,13 +423,29 @@ class MirrorBrainAgent:
 
         for link in decisions.get("links", []):
             conf = link.get("confidence", 0)
-            if conf >= 0.85:
+            if conf >= 0.65:
                 from_uuid = self.registry.resolve(link["from_entity"]) or (self.registry.search(link["from_entity"]) or [{}])[0].get("uuid")
                 to_uuid = self.registry.resolve(link["to_entity"]) or (self.registry.search(link["to_entity"]) or [{}])[0].get("uuid")
                 if from_uuid and to_uuid:
-                    existing = self.registry.db.execute("SELECT 1 FROM relations WHERE from_uuid=? AND to_uuid=? AND relation_type=?", (from_uuid, to_uuid, link["relation"])).fetchone()
+                    # Dedup check: scan existing relations via FakeCursor
+                    existing_rows = self.registry.db.execute(
+                        "SELECT id FROM relations WHERE from_uuid=? AND to_uuid=? AND relation_type=?",
+                        (from_uuid, to_uuid, link["relation"])
+                    ).fetchall()
+                    existing = existing_rows[0] if existing_rows else None
                     if not existing:
-                        self.registry.db.execute("INSERT INTO relations (from_uuid, to_uuid, relation_type, source_text, created_at) VALUES (?,?,?,?,?)", (from_uuid, to_uuid, link["relation"], link.get("reasoning", ""), Note.now()))
+                        import uuid as _uuid
+                        rel_id = _uuid.uuid4().hex
+                        # Store as module concept (for querying)
+                        self.registry.db.execute("INSERT INTO relations (id, from_uuid, to_uuid, relation_type, source_text, created_at) VALUES (?,?,?,?,?,?)", (rel_id, from_uuid, to_uuid, link["relation"], link.get("reasoning", ""), Note.now()))
+                        # ALSO create the actual Neo4j graph edge via c0
+                        from_name = self.registry._uuid_to_name(from_uuid)
+                        to_name = self.registry._uuid_to_name(to_uuid)
+                        if from_name and to_name and self.c0:
+                            try:
+                                self.c0.relate(from_name, to_name, link["relation"])
+                            except Exception:
+                                pass  # Edge creation is best-effort; concept row is already stored
                         self.registry.log_decision(f"create_relation:{link['relation']}", from_uuid, target_uuid=to_uuid, confidence=conf, reasoning=link.get("reasoning", ""), source="llm")
                         report["auto"].append(f"link: {link['from_entity']} → {link['to_entity']}")
             elif conf >= 0.6:
@@ -437,7 +453,7 @@ class MirrorBrainAgent:
 
         for alias in decisions.get("new_aliases", []):
             conf = alias.get("confidence", 0)
-            if conf >= 0.85:
+            if conf >= 0.65:
                 target = self.registry.resolve(alias["canonical_entity"]) or (self.registry.search(alias["canonical_entity"]) or [{}])[0].get("uuid")
                 if target:
                     self.registry.add_alias(alias["alias"], target, source="llm", confidence=conf)
@@ -447,7 +463,7 @@ class MirrorBrainAgent:
 
         for evo in decisions.get("evolutions", []):
             conf = evo.get("confidence", 0)
-            if conf >= 0.85:
+            if conf >= 0.65:
                 target_uuid = self.registry.resolve(evo.get("target", ""))
                 if target_uuid:
                     self.registry.log_decision(f"evolution:{evo.get('action','')}", target_uuid, confidence=conf, reasoning=evo.get("reasoning",""), source="llm")

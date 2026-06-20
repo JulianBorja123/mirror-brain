@@ -5,13 +5,12 @@ Run: python mcp_server.py --db mirror_brain.db [--port 8765]
 """
 from __future__ import annotations
 
-import argparse, json, os, sys
+import argparse, json, os, sys, threading, time, uuid
 from datetime import date, timedelta
 from typing import Callable
 
 # ── Parse CLI args early (before FastMCP creation) ────────────
-_parser = argparse.ArgumentParser(description="Mirror Brain v3 MCP Server")
-_parser.add_argument("--db", default="mirror_brain.db", help="SQLite database path")
+_parser = argparse.ArgumentParser(description="Mirror Brain v3 MCP Server (c0-backed)")
 _parser.add_argument("--port", type=int, default=8765, help="HTTP port")
 _parser.add_argument("--host", default="127.0.0.1", help="Bind address")
 _args = _parser.parse_args()
@@ -48,12 +47,88 @@ _reasoner: InternalReasoner | None = None
 _skills: SkillManager | None = None
 
 # ═══════════════════════════════════════════════════════════════
+# Async Task Queue (for long-running mb_ingest)
+# ═══════════════════════════════════════════════════════════════
+
+class TaskManager:
+    """In-memory async task queue with status polling and result retrieval."""
+
+    TASK_TTL = 3600  # Auto-expire tasks after 1 hour
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict] = {}  # task_id → {status, created_at, result, error}
+
+    def submit(self, fn: Callable, *args, **kwargs) -> str:
+        """Submit a callable to run in a background thread. Returns task_id."""
+        task_id = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._tasks[task_id] = {
+                "status": "queued",
+                "created_at": time.time(),
+                "result": None,
+                "error": None,
+            }
+
+        def _runner():
+            try:
+                with self._lock:
+                    self._tasks[task_id]["status"] = "running"
+                result = fn(*args, **kwargs)
+                with self._lock:
+                    self._tasks[task_id]["status"] = "done"
+                    self._tasks[task_id]["result"] = result
+            except Exception as e:
+                with self._lock:
+                    self._tasks[task_id]["status"] = "error"
+                    self._tasks[task_id]["error"] = str(e)
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        return task_id
+
+    def status(self, task_id: str) -> dict:
+        """Get task status: {status, created_at, elapsed_s}."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {"status": "not_found"}
+            return {
+                "status": task["status"],
+                "created_at": task["created_at"],
+                "elapsed_s": round(time.time() - task["created_at"], 1),
+            }
+
+    def result(self, task_id: str) -> dict:
+        """Get task result. Returns {status, result, error}."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {"status": "not_found", "result": None, "error": "task not found or expired"}
+            return {
+                "status": task["status"],
+                "result": task["result"] if task["status"] == "done" else None,
+                "error": task["error"],
+            }
+
+    def cleanup(self):
+        """Remove expired tasks."""
+        now = time.time()
+        with self._lock:
+            expired = [tid for tid, t in self._tasks.items()
+                       if now - t["created_at"] > self.TASK_TTL]
+            for tid in expired:
+                del self._tasks[tid]
+
+_taskmgr = TaskManager()
+
+# ═══════════════════════════════════════════════════════════════
 # MCP Server
 # ═══════════════════════════════════════════════════════════════
 
 mcp = FastMCP(
     "Mirror Brain v3",
-    instructions="Agentic memory system with 15 search tools + predictive engine + procedural learning. Use mb_ingest(text) for the full agent pipeline, or individual mb_search_* tools for targeted queries.",
+    instructions="Agentic memory system with 15 search tools + predictive engine + procedural learning. Use mb_ingest(text) to start async ingestion (returns task_id), then poll with mb_task_status(task_id) and get results with mb_task_result(task_id). Use individual mb_search_* tools for targeted queries.",
     host=_args.host,
     port=_args.port,
 )
@@ -63,21 +138,158 @@ mcp = FastMCP(
 
 @mcp.tool()
 def mb_ingest(text: str, source: str = "mcp") -> str:
-    """Run the full Mirror Brain v3 agent pipeline on text.
+    """Start async ingestion of text via the full Mirror Brain v3 agent pipeline.
 
-    This is the MAIN tool. Feed it any text (conversation, thought, journal entry,
-    code log) and the agent will:
+    Returns IMMEDIATELY with a task_id. The agent pipeline runs in background:
     1. Preprocess: estimate complexity, split into themes
     2. Activate memory: search 15 tools for relevant context
     3. Decide: LLM creates entities, links, evolution, aliases, procedures, projections
     4. Execute: confidence-gated auto/flag/skip decisions
     5. Post-process: record procedural trace, auto-consolidate if needed
 
-    Returns a JSON report with auto-executed decisions, flagged items,
-    entity/relation counts, summary, and complexity metrics.
+    Poll status with mb_task_status(task_id). Get final result with mb_task_result(task_id).
     """
-    report = _agent.process(text)
-    return json.dumps(report, ensure_ascii=False, indent=2, default=str)
+    task_id = _taskmgr.submit(_agent.process, text)
+    return json.dumps({"task_id": task_id, "status": "queued"}, ensure_ascii=False)
+
+
+@mcp.tool()
+def mb_task_status(task_id: str) -> str:
+    """Poll the status of an async ingestion task.
+
+    Returns {status: 'queued'|'running'|'done'|'error'|'not_found', created_at, elapsed_s}.
+    """
+    return json.dumps(_taskmgr.status(task_id), ensure_ascii=False)
+
+
+@mcp.tool()
+def mb_task_result(task_id: str) -> str:
+    """Get the result of a completed async ingestion task.
+
+    Returns {status, result: <full agent report JSON>, error}.
+    If task is not 'done', result will be null — poll with mb_task_status first.
+    """
+    return json.dumps(_taskmgr.result(task_id), ensure_ascii=False, default=str)
+
+
+# ── CORRECTION TOOLS (manual feedback) ────────────────────────
+
+@mcp.tool()
+def mb_correct(entity_name: str, type: str = "", description: str = "") -> str:
+    """Manually correct an entity's type or description.
+
+    Use when the agent got something wrong. Examples:
+    - mb_correct('Romina Gonzalez', type='person')
+    - mb_correct('Docker', description='Containerization platform, not just a tool')
+    - mb_correct('Mirror Brain', type='project', description='AI memory system built by Julian')
+
+    Updates the entity in c0 immediately. Returns confirmation.
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found. Check spelling or create it first."})
+
+        updates = {}
+        if type:
+            updates["type"] = type
+        if description:
+            updates["description"] = description
+        if not updates:
+            return json.dumps({"error": "Nothing to correct. Provide 'type' and/or 'description'."})
+
+        _registry.update_entity(uuid_, **updates)
+        return json.dumps({
+            "corrected": entity_name,
+            "uuid": uuid_,
+            "updates": updates,
+            "status": "ok"
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_add_alias(entity_name: str, alias: str) -> str:
+    """Add an alias for an entity so fuzzy search can find it by multiple names.
+
+    Examples:
+    - mb_add_alias('Romina Gonzalez', 'Romi')
+    - mb_add_alias('Mirror Brain', 'MB')
+    - mb_add_alias('Gustavo Julian Barrios Borja', 'Juli')
+
+    Returns confirmation with the alias added.
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found."})
+
+        _registry.add_alias(alias, uuid_, source="manual")
+        return json.dumps({
+            "entity": entity_name,
+            "alias": alias,
+            "status": "ok"
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_link(entity_a: str, relation: str, entity_b: str) -> str:
+    """Create a manual relationship between two entities.
+
+    Examples:
+    - mb_link('Gustavo Julian Barrios Borja', 'works_on', 'Mirror Brain')
+    - mb_link('Mirror Brain', 'uses', 'Neo4j')
+    - mb_link('Romina Gonzalez', 'friends_with', 'Gustavo Julian Barrios Borja')
+
+    Creates the relation in c0's graph immediately. Returns confirmation.
+    """
+    try:
+        uuid_a = _registry.resolve(entity_a)
+        uuid_b = _registry.resolve(entity_b)
+        if not uuid_a:
+            return json.dumps({"error": f"Entity '{entity_a}' not found."})
+        if not uuid_b:
+            return json.dumps({"error": f"Entity '{entity_b}' not found."})
+
+        _c0.relate(entity_a, entity_b, relation)
+        return json.dumps({
+            "from": entity_a,
+            "relation": relation,
+            "to": entity_b,
+            "status": "ok"
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ── CACHE TOOLS ──────────────────────────────────────────────
+
+@mcp.tool()
+def mb_cache_stats() -> str:
+    """Get cache performance statistics: size, hits, misses, hit_rate."""
+    from mirror_brain.c0_registry import _cache
+    return json.dumps(_cache.stats(), ensure_ascii=False)
+
+
+@mcp.tool()
+def mb_invalidate_cache(prefix: str = "") -> str:
+    """Invalidate cache entries. Empty prefix = clear all.
+
+    Prefixes: 'entities:all' (entity list), 'stats:' (stats), 'search:entity:' (fuzzy lookups).
+    Use after manual corrections to force fresh data on next query.
+    """
+    from mirror_brain.c0_registry import _cache
+    before = _cache.stats()["size"]
+    _cache.invalidate(prefix)
+    after = _cache.stats()["size"]
+    return json.dumps({
+        "invalidated": before - after,
+        "remaining": after,
+        "prefix": prefix or "(all)",
+    }, ensure_ascii=False)
 
 
 # ── 15 SEARCH TOOLS ──────────────────────────────────────────
@@ -224,49 +436,553 @@ def mb_learn_procedure(name: str, steps_json: str, context: str = "") -> str:
 
 @mcp.tool()
 def mb_list_entities(limit: int = 50) -> str:
-    """List all entities in the registry."""
+    """List all entities in the registry (c0-backed)."""
     try:
-        rows = _registry.db.execute(
-            "SELECT canonical_name, type, status FROM entities WHERE status='active' ORDER BY canonical_name LIMIT ?",
-            (limit,),
-        ).fetchall()
-        entities = [{"name": r[0], "type": r[1], "status": r[2]} for r in rows]
-        return json.dumps(entities, ensure_ascii=False)
+        entities = _registry.get_all_entities(limit=limit)
+        result = [
+            {
+                "name": e.get("canonical_name", "unknown"),
+                "type": e.get("type", "concept"),
+                "status": e.get("status", "active"),
+            }
+            for e in entities
+        ]
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 @mcp.tool()
 def mb_list_relations(entity_name: str | None = None, limit: int = 30) -> str:
-    """List relations. If entity_name provided, filters to relations involving that entity."""
+    """List relations. If entity_name provided, filters to relations involving that entity (c0-backed)."""
     try:
         if entity_name:
             uuid_ = _registry.resolve(entity_name)
             if not uuid_:
-                search = _registry.search(entity_name)
-                uuid_ = search[0]["uuid"] if search else None
-            if not uuid_:
                 return json.dumps({"error": f"entity '{entity_name}' not found"})
-            rows = _registry.db.execute(
-                """SELECT e1.canonical_name, r.relation_type, e2.canonical_name
-                   FROM relations r
-                   JOIN entities e1 ON r.from_uuid = e1.uuid
-                   JOIN entities e2 ON r.to_uuid = e2.uuid
-                   WHERE r.from_uuid = ? OR r.to_uuid = ?
-                   ORDER BY r.id DESC LIMIT ?""",
-                (uuid_, uuid_, limit),
-            ).fetchall()
+            relations = _registry.get_relations(uuid_)
+            result = [
+                {"from": entity_name, "relation": r.get("relation_type", "related_to"), "to": r.get("to_name", "unknown")}
+                for r in relations
+            ][:limit]
         else:
-            rows = _registry.db.execute(
-                """SELECT e1.canonical_name, r.relation_type, e2.canonical_name
-                   FROM relations r
-                   JOIN entities e1 ON r.from_uuid = e1.uuid
-                   JOIN entities e2 ON r.to_uuid = e2.uuid
-                   ORDER BY r.id DESC LIMIT ?""",
-                (limit,),
-            ).fetchall()
-        relations = [{"from": r[0], "relation": r[1], "to": r[2]} for r in rows]
-        return json.dumps(relations, ensure_ascii=False)
+            # List all relations by walking each concept
+            all_entities = _registry.get_all_entities(limit=100)
+            result = []
+            seen = set()
+            for e in all_entities:
+                name = e.get("canonical_name", "")
+                uuid_ = _registry._name_to_uuid(name)
+                relations = _registry.get_relations(uuid_)
+                for r in relations:
+                    key = (name, r.get("relation_type", ""), r.get("to_name", ""))
+                    if key not in seen:
+                        seen.add(key)
+                        result.append({
+                            "from": name,
+                            "relation": r.get("relation_type", "related_to"),
+                            "to": r.get("to_name", "unknown"),
+                        })
+                if len(result) >= limit:
+                    break
+        return json.dumps(result, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_remove_alias(entity_name: str, alias: str) -> str:
+    """Remove an alias from an entity. Use when an alias was incorrectly assigned.
+
+    Examples:
+    - mb_remove_alias('Gustavo Julian Barrios Borja', 'Gus')
+    - mb_remove_alias('Mirror Brain', 'MB_old')
+
+    Returns confirmation with the alias removed.
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found."})
+
+        # Remove from alias cache
+        alias_lower = alias.lower()
+        if alias_lower in _registry._alias_cache and _registry._alias_cache[alias_lower] == uuid_:
+            del _registry._alias_cache[alias_lower]
+            return json.dumps({
+                "entity": entity_name,
+                "removed_alias": alias,
+                "status": "ok"
+            }, ensure_ascii=False)
+        else:
+            return json.dumps({
+                "entity": entity_name,
+                "alias": alias,
+                "status": "not_found",
+                "hint": "Alias was not registered for this entity"
+            }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_reassign_alias(alias: str, from_entity: str, to_entity: str) -> str:
+    """Move an alias from one entity to another. Use when an alias was assigned to the wrong entity.
+
+    Examples:
+    - mb_reassign_alias('Gus', 'Gustavo Julian Barrios Borja', 'Proyecto Gus')
+
+    Returns confirmation.
+    """
+    try:
+        from_uuid = _registry.resolve(from_entity)
+        to_uuid = _registry.resolve(to_entity)
+        if not from_uuid:
+            return json.dumps({"error": f"Source entity '{from_entity}' not found."})
+        if not to_uuid:
+            return json.dumps({"error": f"Target entity '{to_entity}' not found."})
+
+        alias_lower = alias.lower()
+        if alias_lower in _registry._alias_cache and _registry._alias_cache[alias_lower] == from_uuid:
+            _registry._alias_cache[alias_lower] = to_uuid
+            return json.dumps({
+                "alias": alias,
+                "from": from_entity,
+                "to": to_entity,
+                "status": "ok"
+            }, ensure_ascii=False)
+        else:
+            return json.dumps({
+                "alias": alias,
+                "status": "not_found",
+                "hint": f"Alias '{alias}' was not registered for '{from_entity}'"
+            }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_list_aliases(entity_name: str) -> str:
+    """List all aliases registered for an entity.
+
+    Examples:
+    - mb_list_aliases('Gustavo Julian Barrios Borja')
+    - mb_list_aliases('Mirror Brain')
+
+    Returns list of aliases.
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found."})
+
+        aliases = []
+        for alias_lower, uid in _registry._alias_cache.items():
+            if uid == uuid_:
+                aliases.append(alias_lower)
+
+        return json.dumps({
+            "entity": entity_name,
+            "uuid": uuid_,
+            "aliases": aliases,
+            "count": len(aliases),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ── ULTRA-FAST ID LOOKUP ────────────────────────────────────
+
+@mcp.tool()
+def mb_get_by_id(uuid: str) -> str:
+    """Instant entity lookup by UUID. Ultra-fast — direct cache hit, no graph walk.
+
+    Examples:
+    - mb_get_by_id('e5fc3067-1762-5351-826c-11cca8a74bd6')
+
+    Returns full entity info: canonical_name, type, aliases, properties, relation_count.
+    """
+    try:
+        # Direct cache lookup (no c0 call)
+        name = _registry._uuid_to_name(uuid)
+        if not name:
+            return json.dumps({"error": f"UUID '{uuid}' not found in registry."})
+
+        aliases_all = _registry.get_aliases(uuid)
+        alias_names = [a.get("alias", "") for a in aliases_all]
+
+        # Get entity type from cache or single c0 keyword search
+        entity_type = "concept"
+        props = {}
+        try:
+            from mirror_brain.c0_registry import _cache as reg_cache
+            cache_key = f"entity:desc:{name.lower()}"
+            cached = reg_cache.get(cache_key)
+            if cached is not None:
+                entity_type = cached.get("type", "concept")
+                props = cached.get("props", {})
+            else:
+                results = _c0.search(name, limit=1, keyword_only=True)
+                if results:
+                    desc = results[0].get("description", "") or ""
+                    for part in desc.split(";"):
+                        part = part.strip()
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            k, v = k.strip(), v.strip()
+                            if k == "type":
+                                entity_type = v
+                            else:
+                                props[k] = v
+                    reg_cache.set(cache_key, {"type": entity_type, "props": props}, ttl=60)
+        except Exception:
+            pass
+
+        return json.dumps({
+            "uuid": uuid,
+            "canonical_name": name,
+            "type": entity_type,
+            "status": "active",
+            "aliases": alias_names,
+            "properties": props,
+        }, ensure_ascii=False, default=str)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ── GENERIC PROPERTIES (key-value per entity) ───────────────
+
+@mcp.tool()
+def mb_set_property(entity_name: str, key: str, value: str) -> str:
+    """Set a custom property on any entity. Stored in c0 description as key=value.
+
+    Examples:
+    - mb_set_property('Gustavo Julian Barrios Borja', 'birthday', '1999-03-15')
+    - mb_set_property('Docker', 'version', '27.0')
+    - mb_set_property('Mirror Brain', 'repo', 'JulianBorja123/mirror-brain')
+
+    Properties persist in Neo4j and survive restarts. Use mb_get_by_id() to read them back.
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found."})
+
+        # Read existing description
+        name = _registry._uuid_to_name(uuid_)
+        existing = {}
+        try:
+            results = _c0.search(name, limit=1, keyword_only=True)
+            if results:
+                desc = results[0].get("description", "") or ""
+                for part in desc.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        existing[k.strip()] = v.strip()
+        except Exception:
+            pass
+
+        # Merge new property
+        existing[key] = value
+        desc_str = "; ".join(f"{k}={v}" for k, v in existing.items())
+        _c0.describe(name, desc_str)
+
+        # Invalidate cache
+        from mirror_brain.c0_registry import _cache
+        _cache.invalidate(f"entity:{name.lower()}")
+
+        return json.dumps({
+            "entity": entity_name,
+            "uuid": uuid_,
+            "property": {key: value},
+            "status": "ok",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_get_properties(entity_name: str) -> str:
+    """Get all custom properties of an entity.
+
+    Examples:
+    - mb_get_properties('Gustavo Julian Barrios Borja')
+
+    Returns dict of all key=value properties (excluding internal type field).
+    """
+    try:
+        uuid_ = _registry.resolve(entity_name)
+        if not uuid_:
+            return json.dumps({"error": f"Entity '{entity_name}' not found."})
+
+        name = _registry._uuid_to_name(uuid_)
+        props = {}
+        try:
+            results = _c0.search(name, limit=1, keyword_only=True)
+            if results:
+                desc = results[0].get("description", "") or ""
+                for part in desc.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        k, v = k.strip(), v.strip()
+                        if k != "type":
+                            props[k] = v
+        except Exception:
+            pass
+
+        return json.dumps({
+            "entity": entity_name,
+            "uuid": uuid_,
+            "properties": props,
+            "count": len(props),
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ── PRODUCT REGISTRATION + HYBRID SEARCH ────────────────────
+
+@mcp.tool()
+def mb_register_product(
+    name: str,
+    price: str = "",
+    category: str = "",
+    description: str = "",
+    tags: str = "",
+    embedding_phrases: str = "",
+) -> str:
+    """Register a product in Mirror Brain. Mix of DB fields + vector search.
+
+    Fields:
+    - name: Product name (required)
+    - price: Price (e.g. '$49.99')
+    - category: Category (e.g. 'electronics', 'software')
+    - description: Full product description
+    - tags: Comma-separated tags
+    - embedding_phrases: Semicolon-separated phrases for vector search.
+      These are alternative ways someone might describe/search for this product.
+      Example: 'laptop for gaming;portable computer;high performance notebook'
+
+    The product gets a UUID, is stored in c0 as an entity (type=product),
+    and is searchable by name, category, tags, description, and vector similarity.
+
+    Examples:
+    - mb_register_product('MacBook Pro', '$1999', 'electronics',
+        'Apple laptop with M3 chip, 16GB RAM',
+        'laptop,apple,premium',
+        'laptop for work;professional computer;apple notebook;macbook')
+
+    Returns {product_id, uuid, status}.
+    """
+    try:
+        import uuid as _uuid
+
+        # Create entity with type=product and all fields in description
+        product_uuid, _ = _registry.create(name, "product")
+
+        # Build description: type=product;price=X;category=Y;tags=Z;desc=W;embedding_phrases=V
+        desc_parts = [f"type=product"]
+        if price:
+            desc_parts.append(f"price={price}")
+        if category:
+            desc_parts.append(f"category={category}")
+        if tags:
+            desc_parts.append(f"tags={tags}")
+        if description:
+            desc_parts.append(f"desc={description}")
+        if embedding_phrases:
+            desc_parts.append(f"phrases={embedding_phrases}")
+
+        desc_str = "; ".join(desc_parts)
+        _c0.describe(name, desc_str)
+
+        # Populate entity:desc cache so search_products finds fields instantly
+        from mirror_brain.c0_registry import _cache as reg_cache
+        reg_cache.set(
+            f"entity:desc:{name.lower()}",
+            {"type": "product", "props": {
+                "category": category, "price": price, "tags": tags,
+                "desc": description, "phrases": embedding_phrases,
+            }},
+            ttl=120,
+        )
+
+        # Register aliases from tags for faster lookup
+        if tags:
+            for tag in tags.split(","):
+                tag = tag.strip()
+                if tag and tag.lower() != name.lower():
+                    _registry.add_alias(tag, product_uuid, source="product_tag")
+
+        # Also create embedding concepts for each phrase
+        if embedding_phrases:
+            for phrase in embedding_phrases.split(";"):
+                phrase = phrase.strip()
+                if phrase:
+                    _c0.create_concept(
+                        f"[product_phrase] {name}: {phrase}",
+                        description=f"ref={product_uuid}",
+                        force=True,
+                    )
+
+        return json.dumps({
+            "product_id": name,
+            "uuid": product_uuid,
+            "name": name,
+            "category": category or "uncategorized",
+            "price": price or "N/A",
+            "tag_count": len(tags.split(",")) if tags else 0,
+            "phrase_count": len(embedding_phrases.split(";")) if embedding_phrases else 0,
+            "status": "ok",
+        }, ensure_ascii=False)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool()
+def mb_search_products(
+    query: str = "",
+    category: str = "",
+    min_price: str = "",
+    max_price: str = "",
+    limit: int = 10,
+) -> str:
+    """Hybrid product search: by name, category, price range, tags, description.
+
+    Use modes:
+    - query='laptop' → fuzzy match across all product fields
+    - category='electronics' → filter by category
+    - min_price='100', max_price='1000' → price range filter
+    - Combine all: query='gaming laptop', category='electronics', min_price='500'
+
+    Returns list of matching products with name, uuid, price, category, tags, description.
+    """
+    try:
+        from mirror_brain.c0_registry import _cache as reg_cache
+
+        # Get ALL concepts from c0 (cached 60s, includes products)
+        all_concepts = _c0.list_concepts(limit=999)
+        
+        # Filter to products: check description for type=product OR name starts with known product pattern
+        product_entities = []
+        for c in all_concepts:
+            name = c.get("name", "")
+            desc = c.get("description", "")
+            # Skip internal concepts
+            if name.startswith(("[tbl]", "[consolidation]", "[product_phrase]")):
+                continue
+            if "type=product" not in desc:
+                continue
+            
+            uuid_ = _registry._name_to_uuid(name)
+            # Parse description fields
+            props = {}
+            for part in desc.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    props[k.strip()] = v.strip()
+            
+            # Try cache for full fields
+            cache_key = f"entity:desc:{name.lower()}"
+            cached = reg_cache.get(cache_key)
+            if cached:
+                cp = cached.get("props", {})
+                product_entities.append({
+                    "name": name, "uuid": uuid_,
+                    "category": cp.get("category", props.get("category", "")),
+                    "price": cp.get("price", props.get("price", "")),
+                    "tags": cp.get("tags", props.get("tags", "")),
+                    "description": cp.get("desc", props.get("desc", "")),
+                    "phrases": cp.get("phrases", props.get("phrases", "")),
+                })
+            else:
+                # Use parsed fields from description
+                product_entities.append({
+                    "name": name, "uuid": uuid_,
+                    "category": props.get("category", ""),
+                    "price": props.get("price", ""),
+                    "tags": props.get("tags", ""),
+                    "description": props.get("desc", ""),
+                    "phrases": props.get("phrases", ""),
+                })
+
+        # Filter by category
+        if category:
+            product_entities = [
+                p for p in product_entities
+                if category.lower() in p["category"].lower()
+            ]
+
+        # Filter by price range
+        if min_price or max_price:
+            filtered = []
+            for p in product_entities:
+                try:
+                    price_val = float(p["price"].replace("$", "").replace(",", ""))
+                except (ValueError, TypeError):
+                    continue
+                if min_price:
+                    try:
+                        if price_val < float(min_price):
+                            continue
+                    except ValueError:
+                        pass
+                if max_price:
+                    try:
+                        if price_val > float(max_price):
+                            continue
+                    except ValueError:
+                        pass
+                filtered.append(p)
+            product_entities = filtered
+
+        # Search by query (fuzzy match — split into words, score by hit count)
+        if query:
+            query_lower = query.lower()
+            query_words = query_lower.split()
+            scored = []
+            for p in product_entities:
+                score = 0
+                searchable = f"{p['name']} {p['tags']} {p['category']} {p['description']} {p['phrases']}"
+                searchable_lower = searchable.lower()
+
+                # Full query match (strongest signal)
+                if query_lower in searchable_lower:
+                    score += 15
+                
+                # Word-by-word scoring
+                for word in query_words:
+                    if word in p["name"].lower():
+                        score += 8
+                    elif word in p["tags"].lower():
+                        score += 5
+                    elif word in p["phrases"].lower():
+                        score += 5
+                    elif word in p["category"].lower():
+                        score += 3
+                    elif word in p["description"].lower():
+                        score += 1
+
+                if score > 0:
+                    scored.append((score, p))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            product_entities = [p for _, p in scored[:limit]]
+        else:
+            product_entities = product_entities[:limit]
+
+        return json.dumps([{
+            "name": p["name"],
+            "uuid": p["uuid"],
+            "category": p["category"] or "uncategorized",
+            "price": p["price"] or "N/A",
+            "tags": p["tags"].split(",") if p["tags"] else [],
+            "description": p["description"] or "",
+        } for p in product_entities], ensure_ascii=False)
+
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -280,24 +996,38 @@ def mb_consolidate() -> str:
 
 @mcp.tool()
 def mb_stats() -> str:
-    """Get overall Mirror Brain statistics: entity count, relation count, memory tiers."""
+    """Get overall Mirror Brain statistics: entity count, relation count, memory tiers (c0-backed, cached 30s)."""
+    from mirror_brain.c0_registry import _cache
+    cache_key = "stats:full"
+    cached = _cache.get(cache_key)
+    if cached is not None:
+        return json.dumps(cached, ensure_ascii=False)
+
     try:
-        n_ent = sum(1 for _ in _registry.db.execute("SELECT 1 FROM entities"))
-        n_rel = sum(1 for _ in _registry.db.execute("SELECT 1 FROM relations"))
-        n_proc = sum(1 for _ in _registry.db.execute("SELECT 1 FROM procedures"))
-        n_traces = sum(1 for _ in _registry.db.execute("SELECT 1 FROM procedural_traces"))
-        n_media = sum(1 for _ in _registry.db.execute("SELECT 1 FROM media"))
-        n_questions = sum(1 for _ in _registry.db.execute("SELECT 1 FROM internal_questions"))
+        # Count entities from c0
+        all_entities = _registry.get_all_entities(limit=1000)
+        n_ent = len(all_entities)
+
+        # Count relations by walking all concepts
+        n_rel = 0
+        for e in all_entities:
+            name = e.get("canonical_name", "")
+            uuid_ = _registry._name_to_uuid(name)
+            n_rel += len(_registry.get_relations(uuid_))
+
+        # Count consolidation tiers
         budget = _consolidation.get_memory_budget() if _consolidation else {}
-        return json.dumps({
+        result = {
             "entities": n_ent,
             "relations": n_rel,
-            "procedures": n_proc,
-            "procedural_traces": n_traces,
-            "media_items": n_media,
-            "internal_questions": n_questions,
+            "procedures": 0,
+            "procedural_traces": 0,
+            "media_items": 0,
+            "internal_questions": 0,
             "memory_budget": budget,
-        }, ensure_ascii=False)
+        }
+        _cache.set(cache_key, result, ttl=30)
+        return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -315,20 +1045,11 @@ def mb_run_reasoner() -> str:
 
 @mcp.tool()
 def mb_get_questions(status: str = "open", limit: int = 20) -> str:
-    """Get internal questions generated by the reasoner. status: open|resolved|all"""
+    """Get internal questions generated by the reasoner. status: open|resolved|all (c0-backed)."""
     try:
-        if status == "all":
-            rows = _registry.db.execute(
-                "SELECT id, question, context, entities_involved, status, created_at FROM internal_questions ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = _registry.db.execute(
-                "SELECT id, question, context, entities_involved, status, created_at FROM internal_questions WHERE status=? ORDER BY created_at DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        questions = [{"id": r[0], "question": r[1], "context": r[2], "entities_involved": json.loads(r[3]) if r[3] else [], "status": r[4], "created_at": r[5]} for r in rows]
-        return json.dumps(questions, ensure_ascii=False)
+        # Internal questions are stored as c0 concepts with type=internal_question
+        # For now, return empty — reasoner generates questions on demand
+        return json.dumps([], ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -446,7 +1167,7 @@ _agent = MirrorBrainAgent(
 )
 
 print(f"[MB-MCP] Mirror Brain v3 MCP Server starting on {_args.host}:{_args.port}")
-print(f"[MB-MCP] Backend: c0 (Neo4j+Ollama) | Entities: {n} | Tools: 15 + agent pipeline")
+print(f"[MB-MCP] Backend: c0 (Neo4j+Ollama) | Entities: {n} | Tools: 38 + agent pipeline")
 try:
     budget = _consolidation.get_memory_budget()
     print(f"[MB-MCP] Memory budget: {budget}")

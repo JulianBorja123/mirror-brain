@@ -282,10 +282,16 @@ def _extractive_monthly(weekly_rows: list[tuple], max_chars_per_week: int = 200)
 class HierarchicalConsolidation:
     """Progressive memory compaction: daily → weekly → monthly.
 
+    Storage backend: c0 (Neo4j + Ollama) via C0Registry compatibility layer.
+    Consolidation entries are stored as c0 concepts with prefix
+    ``[consolidation] {tier} {date}`` and the full JSON result as the
+    concept description.
+
     Parameters
     ----------
-    registry : EntityRegistry
-        The Mirror Brain entity registry (provides ``.db`` access).
+    registry : C0Registry
+        The Mirror Brain entity registry (provides ``.db`` access via
+        FakeCursor compatibility layer).
     llm_call : callable, optional
         A function ``llm_call(prompt: str) -> str`` that invokes an LLM.
         When ``None``, all consolidation uses extractive fallback
@@ -623,7 +629,7 @@ class HierarchicalConsolidation:
         ).fetchall()
 
         for row in daily_rows:
-            date_str, summary, emotional_arc, key_entities = row
+            date_str, summary, emotional_arc, key_entities, *_ = row
             needs_compact = (
                 len(summary) > 300
                 or emotional_arc in ("", "[]")
