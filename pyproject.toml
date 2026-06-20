@@ -1,0 +1,16 @@
+[project]
+name = "mirror-brain"
+version = "0.1.0"
+description = "Personal AI memory and reflection system"
+requires-python = ">=3.11"
+dependencies = []  # stdlib only for now
+
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
