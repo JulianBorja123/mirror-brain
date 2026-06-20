@@ -168,7 +168,17 @@ class MirrorBrainAgent:
     # ── Activation ──────────────────────────────────────────
 
     def _activate(self, text: str, themes: list, complexity: dict) -> dict:
-        """Search the brain using v2 + v3 tools based on text characteristics."""
+        """Search the brain using tools dynamically selected by text complexity.
+
+        Tool selection strategy:
+        - char_count > 2000: include semantic search, full entity extraction
+        - emotional_density > 0.03: include emotion search, trend, cycles, anomalies
+        - entity_density > 0.02: include minimap + fuzzy for all extracted entities
+        - entity_density > 0.05: also include trend/cycles for top entities
+        - estimated_themes > 3: include procedures search
+        - estimated_themes > 5: include broader temporal range (0-30 days)
+        - Always: temporal context (21d window), weekly+monthly summary, memory budget
+        """
         ctx = {
             "temporal_context": [],
             "entity_contexts": {},
@@ -182,75 +192,102 @@ class MirrorBrainAgent:
             "anomalies": [],
             "memory_budget": None,
             "procedures_suggested": [],
+            "tools_used": [],  # track which tools were activated
         }
 
-        # Always: temporal context (default window)
+        char_count = complexity.get("char_count", 0)
+        emo_dens = complexity.get("emotional_density", 0)
+        ent_dens = complexity.get("entity_density", 0)
+        est_themes = complexity.get("estimated_themes", 1)
+
+        # ── ALWAYS ──
         ctx["temporal_context"] = self.tools.search_temporal(self.registry, days_ago=0, window=21)
-
-        # Always: weekly + monthly summary
+        ctx["tools_used"].append("search_temporal")
         ctx["weekly_summary"] = self.tools.get_weekly_summary(self.registry)
+        ctx["tools_used"].append("get_weekly_summary")
         ctx["monthly_summary"] = self.tools.get_monthly_summary(self.registry)
-
-        # Always: memory budget
+        ctx["tools_used"].append("get_monthly_summary")
         ctx["memory_budget"] = self.tools.get_memory_budget(self.registry)
+        ctx["tools_used"].append("get_memory_budget")
 
-        # Extract potential entity names from themes
+        # ── ENTITY-BASED (scales with entity density) ──
         entity_names = self._extract_potential_entities(themes)
 
-        for name in entity_names[:10]:  # limit
+        # How many entities to process: proportional to density
+        if ent_dens > 0.05:
+            max_entities = min(15, len(entity_names))
+        elif ent_dens > 0.02:
+            max_entities = min(10, len(entity_names))
+        else:
+            max_entities = min(5, len(entity_names))
+
+        for name in entity_names[:max_entities]:
             minimap = self.tools.get_minimap(self.registry, name)
-            if minimap:
+            if minimap and not minimap.get("error"):
                 ctx["entity_contexts"][name] = minimap
+                ctx["tools_used"].append(f"get_minimap({name})")
+
             fuzzy_results = self.tools.search_fuzzy(self.registry, name)
             if fuzzy_results:
                 ctx["fuzzy_matches"].extend(fuzzy_results)
+                ctx["tools_used"].append(f"search_fuzzy({name})")
 
-            # v3: trends and cycles for recognized entities
-            if minimap and not minimap.get("error"):
-                try:
-                    trend = self.tools.get_trend(self.registry, name, metric="oxytocin", window=30)
-                    if trend and not trend.get("error"):
-                        ctx["trends"][name] = trend
-                except Exception:
-                    pass
-                try:
-                    cycles = self.tools.search_cycles(self.registry, name, metric="oxytocin")
-                    if cycles and cycles.get("has_cycle"):
-                        ctx["cycles"][name] = cycles
-                except Exception:
-                    pass
+            # Trends + cycles only if entity recognized AND density is high
+            if minimap and not minimap.get("error") and ent_dens > 0.03:
+                trend = self.tools.get_trend(self.registry, name, metric="oxytocin", window=30)
+                if trend and not trend.get("error"):
+                    ctx["trends"][name] = trend
+                    ctx["tools_used"].append(f"get_trend({name})")
+                cycles = self.tools.search_cycles(self.registry, name, metric="oxytocin")
+                if cycles and cycles.get("has_cycle"):
+                    ctx["cycles"][name] = cycles
+                    ctx["tools_used"].append(f"search_cycles({name})")
 
-        # Emotional search if text has emotional density
-        if complexity.get("emotional_density", 0) > 0.05:
-            for emotion in ["oxytocin", "cortisol", "dopamine", "adrenaline"]:
-                matches = self.tools.search_by_emotion(self.registry, emotion, threshold=0.4, limit=5)
+        # ── EMOTIONAL (triggers when emotional density detected) ──
+        if emo_dens > 0.03:
+            emotions_to_check = ["oxytocin", "cortisol", "dopamine", "adrenaline"]
+            # If very emotional (>8%), check all emotions. Otherwise top 2.
+            if emo_dens > 0.08:
+                check_emotions = emotions_to_check
+            else:
+                check_emotions = emotions_to_check[:2]
+            for emotion in check_emotions:
+                matches = self.tools.search_by_emotion(self.registry, emotion, threshold=0.3, limit=5)
                 if matches:
                     ctx["emotional_matches"].extend(matches)
+                    ctx["tools_used"].append(f"search_by_emotion({emotion})")
 
-        # Anomaly detection for known entities
-        for name in entity_names[:5]:
-            try:
-                anoms = self.tools.get_anomalies(self.registry, name, metric="oxytocin")
-                if anoms:
-                    ctx["anomalies"].extend([{**a, "entity": name} for a in anoms[:3]])
-            except Exception:
-                pass
+            # Anomalies only for most emotional texts
+            if emo_dens > 0.06:
+                for name in entity_names[:3]:
+                    anoms = self.tools.get_anomalies(self.registry, name, metric="oxytocin")
+                    if anoms:
+                        ctx["anomalies"].extend([{**a, "entity": name} for a in anoms[:2]])
+                        ctx["tools_used"].append(f"get_anomalies({name})")
 
-        # Procedure suggestions based on text
-        try:
-            procedures = self.tools.search_procedures(self.registry, text[:500], limit=3)
+        # ── SEMANTIC (triggers for long/complex texts) ──
+        if char_count > 2000 or est_themes > 3:
+            for theme in themes[:min(3, est_themes)]:
+                text_sample = theme["text"][:200]
+                if self.c0:
+                    results = self.tools.search_semantic(self.registry, self.c0, text_sample, limit=5)
+                    if results:
+                        ctx["semantic_matches"].extend(results)
+                        ctx["tools_used"].append("search_semantic")
+
+        # ── PROCEDURAL (triggers for multi-theme texts) ──
+        if est_themes > 3 or char_count > 1000:
+            procedures = self.tools.search_procedures(self.registry, text[:500], limit=5)
             if procedures:
                 ctx["procedures_suggested"] = procedures
-        except Exception:
-            pass
+                ctx["tools_used"].append("search_procedures")
 
-        # Semantic search on key phrases
-        for theme in themes[:3]:
-            text_sample = theme["text"][:200]
-            if self.c0:
-                results = self.tools.search_semantic(self.registry, self.c0, text_sample, limit=5)
-                if results:
-                    ctx["semantic_matches"].extend(results)
+        # ── BROADER TEMPORAL (triggers for very complex texts) ──
+        if est_themes > 5 or char_count > 3000:
+            broader = self.tools.search_temporal_range(self.registry, 0, 30)
+            if broader:
+                ctx["temporal_context"].extend(broader[:10])
+                ctx["tools_used"].append("search_temporal_range(0-30d)")
 
         return ctx
 

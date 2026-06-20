@@ -161,5 +161,30 @@ def init_db(db_path: str) -> sqlite3.Connection:
         )
     """)
 
+    # 12. internal_questions — self-reflection questions from InternalReasoner
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS internal_questions (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            question            TEXT NOT NULL DEFAULT '',
+            context             TEXT NOT NULL DEFAULT '',
+            entities_involved   TEXT NOT NULL DEFAULT '[]',
+            status              TEXT NOT NULL DEFAULT 'open',
+            created_at          TEXT NOT NULL DEFAULT '',
+            resolved_at         TEXT NOT NULL DEFAULT '',
+            resolution          TEXT NOT NULL DEFAULT ''
+        )
+    """)
+
+    # 13. reasoner_runs — meta-summary of each InternalReasoner run
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS reasoner_runs (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at              TEXT NOT NULL DEFAULT '',
+            phases_completed    TEXT NOT NULL DEFAULT '[]',
+            questions_generated INTEGER NOT NULL DEFAULT 0,
+            connections_suggested INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+
     conn.commit()
     return conn
