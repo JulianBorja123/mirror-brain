@@ -45,3 +45,4 @@ htmlcov/
 
 # Local configuration
 *.local
+mb_demo*.db
