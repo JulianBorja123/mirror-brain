@@ -1076,7 +1076,7 @@ def _get_deepseek_key():
         for hp in [os.path.expanduser("~/.hermes/env"),
                    os.path.expanduser("~/AppData/Local/hermes/.env")]:
             if os.path.exists(hp):
-                with open(hp) as f:
+                with open(hp, encoding="utf-8") as f:
                     for line in f:
                         if "DEEPSEEK_API_KEY" in line:
                             key = line.split("=", 1)[1].strip().strip('"').strip("'")
