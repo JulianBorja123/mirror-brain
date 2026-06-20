@@ -157,7 +157,7 @@ for batch in range(3):
     # Raw c0 export
     r0 = subprocess.run(
         ["docker", "exec", "mirrorbrain-c0", "c0", "export", "--format", "json"],
-        capture_output=True, text=True, timeout=15
+        capture_output=True, encoding="utf-8", timeout=15
     )
     try:
         c0_data = json.loads(r0.stdout)

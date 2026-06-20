@@ -466,25 +466,8 @@ def mb_list_relations(entity_name: str | None = None, limit: int = 30) -> str:
                 for r in relations
             ][:limit]
         else:
-            # List all relations by walking each concept
-            all_entities = _registry.get_all_entities(limit=100)
-            result = []
-            seen = set()
-            for e in all_entities:
-                name = e.get("canonical_name", "")
-                uuid_ = _registry._name_to_uuid(name)
-                relations = _registry.get_relations(uuid_)
-                for r in relations:
-                    key = (name, r.get("relation_type", ""), r.get("to_name", ""))
-                    if key not in seen:
-                        seen.add(key)
-                        result.append({
-                            "from": name,
-                            "relation": r.get("relation_type", "related_to"),
-                            "to": r.get("to_name", "unknown"),
-                        })
-                if len(result) >= limit:
-                    break
+            # List all relations via optimized c0 export cache
+            result = _c0.list_relations(limit=limit)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})

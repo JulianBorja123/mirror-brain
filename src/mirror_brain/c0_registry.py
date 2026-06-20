@@ -76,12 +76,19 @@ class C0Registry:
     without changes to their method call signatures.
     """
 
-    def __init__(self, c0_client: C0Client):
-        self.c0 = c0_client
+    def __init__(self, c0_client: Any = None):
+        if c0_client is None or isinstance(c0_client, str):
+            self.c0 = C0Client()
+        else:
+            self.c0 = c0_client
         self.db = self  # Compatibility shim for modules that access registry.db
         # In-memory caches for fast lookups (c0 search is the source of truth)
         self._alias_cache: dict[str, str] = {}  # alias_lower → uuid
         self._name_cache: dict[str, str] = {}   # uuid → canonical_name
+
+    def close(self):
+        """Dummy close method for backward-compatibility with SQLite EntityRegistry."""
+        pass
 
     def ensure_ready(self):
         """Verify c0 is available."""
@@ -389,6 +396,9 @@ class C0Registry:
             return cached
 
         results = self.c0.search(name, limit=10, keyword_only=True)
+        # Verify if any result matches the search term as a substring
+        if not any(name.lower() in r.get("name", "").lower() for r in results):
+            results = self.c0.search(name, limit=10, keyword_only=False)
         filtered = [
             {
                 "uuid": self._name_to_uuid(r.get("name", "")),
@@ -403,13 +413,43 @@ class C0Registry:
         _cache.set(cache_key, filtered, ttl=60)
         return filtered
 
-    def ingest(self, name: str, type_: str = "concept", llm_confidence: float = 1.0):
-        """Create entity if not exists. Returns (uuid, c0_ref) like EntityRegistry."""
-        return self.create(name, type_)
+    def list_by_type(self, type_: str) -> list[dict]:
+        """List entities of a specific type (c0-backed)."""
+        entities = self.get_all_entities(limit=500)
+        return [e for e in entities if e.get("type") == type_]
+
+    def ingest(
+        self,
+        name: str,
+        type_: str = "concept",
+        mention_count: int = 1,
+        parent_entity: str = "",
+        llm_confidence: float = 1.0,
+    ) -> tuple[Optional[str], Optional[str], str]:
+        """Ingest wrapper using EntityCriteria logic to decide creation/resolution."""
+        from .criteria import EntityCriteria
+        criteria = EntityCriteria()
+
+        existing = self.resolve(name)
+        if existing:
+            return existing, self._make_c0_ref(existing), "resolved_existing"
+
+        should, reason = criteria.should_create_entity(
+            name=name,
+            type_=type_,
+            mention_count=mention_count,
+            parent_entity=parent_entity if parent_entity else None,
+            llm_confidence=llm_confidence,
+        )
+        if should:
+            uuid_, c0_ref = self.create(name, type_)
+            return uuid_, c0_ref, f"created: {reason}"
+        else:
+            return None, None, f"skipped: {reason}"
 
     def log_decision(self, action: str, entity_uuid: str, target_uuid: str = "",
                      confidence: float = 0.0, reasoning: str = "",
-                     source: str = "") -> None:
+                     source: str = "", **kwargs) -> None:
         """No-op: decision logging for audit (stored implicitly in c0)."""
         pass
 

@@ -245,6 +245,20 @@ class SearchTools:
                 except Exception:
                     pass
 
+        # ── Phase 4: Semantic Search Fallback ──
+        if not rows and hasattr(registry, "c0") and registry.c0:
+            try:
+                sem_results = registry.c0.search(name, limit=5, threshold=0.35)
+                for r in sem_results:
+                    name_str = r.get("name", "")
+                    if name_str and not name_str.startswith(("[tbl]", "[consolidation]", "[product_phrase]")):
+                        uid = registry._name_to_uuid(name_str)
+                        row_tuple = (uid, name_str, registry._extract_type(r.get("description", "")), "active")
+                        if not any(item[0] == uid for item in rows):
+                            rows.append(row_tuple)
+            except Exception:
+                pass
+
         if not rows:
             return []
 

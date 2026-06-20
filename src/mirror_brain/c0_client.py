@@ -37,7 +37,7 @@ class C0Client:
         self.namespace = namespace
         self.container = container
         self._checked = False
-        self._export_cache: tuple[float, list[dict]] = (0, [])  # (expiry_ts, data)
+        self._export_cache: tuple[float, list[dict], list[dict]] = (0, [], [])  # (expiry_ts, concepts, relations)
 
     # ── Health ────────────────────────────────────────────────────
 
@@ -250,17 +250,36 @@ class C0Client:
                     "description": props.get("description", ""),
                     "similarity": 1.0,
                 })
+            
+            relationships = data.get("relationships", []) if isinstance(data, dict) else []
+            relations_results = []
+            for rel in relationships:
+                relations_results.append({
+                    "from": rel.get("start_name", ""),
+                    "relation": rel.get("rel_type", "related_to"),
+                    "to": rel.get("end_name", ""),
+                })
+
             # Cache full result for 60s
-            self._export_cache = (now + 60, results)
+            self._export_cache = (now + 60, results, relations_results)
             if namespace:
                 results = [r for r in results if r.get("namespace") == namespace]
             return results[:limit]
         except json.JSONDecodeError:
             return []
 
+    def list_relations(self, limit: int = 100) -> list[dict]:
+        """List relations via c0 export. Cached 60s."""
+        now = time.time()
+        if self._export_cache[0] > now:
+            return self._export_cache[2][:limit]
+        
+        self.list_concepts(limit=1)
+        return self._export_cache[2][:limit]
+
     def invalidate_export_cache(self):
         """Force next list_concepts() to re-fetch from c0."""
-        self._export_cache = (0, [])
+        self._export_cache = (0, [], [])
 
     # ── Internals ─────────────────────────────────────────────────
 
@@ -270,7 +289,7 @@ class C0Client:
         result = subprocess.run(
             cmd,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=timeout,
         )
         if result.returncode != 0:
