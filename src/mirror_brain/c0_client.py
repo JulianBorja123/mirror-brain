@@ -1,97 +1,325 @@
 """
-Mirror Brain v1.0 — c0 CLI client.
+Mirror Brain v3.1 — c0 CLI client (hardened).
 Python wrapper around the c0 binary (Rust) via subprocess.
-c0 must be running in Docker or accessible on PATH.
+c0 runs in Docker (mirrorbrain-c0) and is accessed via `docker exec`.
 """
 import subprocess
 import json
 import os
+import time
 from typing import Optional
 
 
+class C0Error(RuntimeError):
+    """c0 operation failed."""
+
+
+class C0NotAvailableError(C0Error):
+    """c0 binary not found."""
+
+
+class C0BackendError(C0Error):
+    """Neo4j or Ollama unreachable."""
+
+
 class C0Client:
-    """Minimal wrapper over the c0 CLI for graph operations."""
+    """Wrapper over the c0 CLI for graph + vector operations.
 
-    def __init__(self, namespace: str = "mirrorbrain",
-                 binary: str = "c0",
-                 neo4j_uri: str = "neo4j://localhost:7687",
-                 ollama_host: str = "ollama:11434",
-                 ollama_model: str = "nomic-embed-text"):
+    c0 runs inside the ``mirrorbrain-c0`` Docker container.
+    All commands are executed via ``docker exec mirrorbrain-c0 c0 ...``.
+    """
+
+    def __init__(
+        self,
+        namespace: str = "mirrorbrain",
+        container: str = "mirrorbrain-c0",
+    ):
         self.namespace = namespace
-        self.binary = binary
-        self.env = {
-            **os.environ,
-            "C0_NEO4J_URI": neo4j_uri,
-            "C0_OLLAMA_HOST": ollama_host,
-            "C0_OLLAMA_MODEL": ollama_model,
-        }
+        self.container = container
+        self._checked = False
 
-    def _run(self, *args, timeout: int = 30) -> str:
-        """Run c0 and return stdout, raise on failure."""
-        result = subprocess.run(
-            [self.binary, *args],
-            capture_output=True, text=True, timeout=timeout,
-            env=self.env,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"c0 failed (exit {result.returncode}): {result.stderr.strip()}")
-        return result.stdout.strip()
+    # ── Health ────────────────────────────────────────────────────
+
+    def health(self) -> dict:
+        """Check c0 health (Neo4j + Ollama + namespace)."""
+        output = self._docker_exec("health")
+        return self._parse_key_value(output) if output else {}
+
+    def ensure_ready(self):
+        """Verify c0 is reachable. Raises C0NotAvailableError if not."""
+        if self._checked:
+            return
+        try:
+            self.health()
+            self._checked = True
+        except Exception as e:
+            raise C0NotAvailableError(f"c0 not available: {e}") from e
 
     # ── CRUD ──────────────────────────────────────────────────────
 
-    def create(self, name: str, description: str = "") -> str:
-        """Create a concept node. Returns the name as confirmation."""
-        cmd = ["create", name]
+    def create_concept(
+        self,
+        name: str,
+        description: str = "",
+        source: str = "",
+        valid_at: str = "",
+        force: bool = False,
+    ) -> str:
+        """Create a concept node. Returns the canonical name on success.
+
+        Uses: ``c0 add concept <name> [--description ...] [--source ...]``
+        """
+        args = ["add", "concept", name]
         if description:
-            cmd.append(description)
-        return self._run(*cmd)
+            args.extend(["--description", description])
+        if source:
+            args.extend(["--source", source])
+        if valid_at:
+            args.extend(["--valid-at", valid_at])
+        if force:
+            args.append("--force")
+        output = self._docker_exec(*args)
+        return name
 
-    def search(self, query: str, limit: int = 10) -> list[dict]:
-        """Hybrid search (exact → keyword → vector RRF)."""
-        output = self._run("search", query, "--limit", str(limit))
-        return self._parse_list(output)
+    def describe(self, name: str, description: str) -> None:
+        """Add or update a concept's description.
 
-    def walk(self, name: str, depth: int = 2) -> list[dict]:
-        """Graph traversal — walk connected nodes."""
-        output = self._run("walk", name, "--depth", str(depth))
-        return self._parse_list(output)
+        Uses: ``c0 describe <name> <description>``
+        """
+        self._docker_exec("describe", name, description)
 
-    def relate(self, from_name: str, to_name: str, relation: str):
-        """Create a relationship between two concepts."""
-        return self._run("relate", from_name, relation, to_name)
+    def relate(self, from_name: str, to_name: str, relation_type: str) -> None:
+        """Create a relationship between two concepts.
 
-    def supersede(self, name: str, new_description: str):
-        """Version a concept — supersede old version."""
-        return self._run("supersede", name, new_description)
+        Uses: ``c0 relate <from> <relation_type> <to>``
+        """
+        self._docker_exec("relate", from_name, relation_type, to_name)
 
-    def get(self, name: str, as_of: Optional[str] = None) -> dict:
-        """Get concept details, optionally at a point in time."""
-        cmd = ["get", name]
+    def supersede(self, old_name: str, new_name: str, as_of: str = "") -> None:
+        """Version a concept — supersede with new version.
+
+        Uses: ``c0 supersede <old> --with <new> [--as-of <date>]``
+        """
+        args = ["supersede", old_name, "--with", new_name]
         if as_of:
-            cmd.extend(["--as-of", as_of])
-        output = self._run(*cmd)
-        return self._parse_dict(output)
+            args.extend(["--as-of", as_of])
+        self._docker_exec(*args)
 
-    # ── Helpers ───────────────────────────────────────────────────
+    def invalidate(self, name: str, because: str = "") -> None:
+        """Mark a concept as invalid.
 
-    @staticmethod
-    def _parse_list(output: str) -> list[dict]:
-        """Parse c0 output that looks like a JSON-like list of dicts."""
+        Uses: ``c0 invalidate concept <name> [--because ...]``
+        """
+        args = ["invalidate", "concept", name]
+        if because:
+            args.extend(["--because", because])
+        self._docker_exec(*args)
+
+    # ── Search ────────────────────────────────────────────────────
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.3,
+        keyword_only: bool = False,
+        vector_only: bool = False,
+    ) -> list[dict]:
+        """Hybrid search (exact → keyword → vector RRF).
+
+        Uses: ``c0 search <query> --limit <N> --threshold <T> --json``
+
+        Returns list of dicts with keys: name, namespace, description, similarity.
+        """
+        args = ["search", query, "--limit", str(limit), "--threshold", str(threshold), "--json"]
+        if keyword_only:
+            args.append("--keyword-only")
+        if vector_only:
+            args.append("--vector-only")
+        output = self._docker_exec(*args)
+        if not output:
+            return []
+        try:
+            results = json.loads(output)
+            if isinstance(results, list):
+                return results
+            return []
+        except json.JSONDecodeError:
+            if "No concepts found" in output:
+                return []
+            # Fallback: treat as raw text lines
+            return [{"raw": line.strip()} for line in output.split("\n") if line.strip()]
+
+    def find(self, pattern: str) -> list[dict]:
+        """Simple text search by name.
+
+        Uses: ``c0 find <pattern>``
+        """
+        output = self._docker_exec("find", pattern)
+        if not output:
+            return []
+        # c0 find returns text: "namespace: name" per line
+        results = []
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            results.append({"raw": line})
+        return results
+
+    def walk(
+        self,
+        start: str,
+        depth: int = 2,
+        as_of: str = "",
+        include_expired: bool = False,
+    ) -> dict:
+        """Graph traversal — walk from a concept through connected nodes.
+
+        Uses: ``c0 walk <start> --depth <N> [--as-of <date>]``
+
+        Returns dict with keys:
+          - ``start``: the resolved concept name
+          - ``patches``: list of text lines from "KNOWLEDGE PATCH" section
+          - ``connected``: list of text lines from "CONNECTED" section
+        """
+        args = ["walk", start, "--depth", str(depth)]
+        if as_of:
+            args.extend(["--as-of", as_of])
+        if include_expired:
+            args.append("--include-expired")
+        output = self._docker_exec(*args)
+        return self._parse_walk_output(output)
+
+    def extract_concepts(
+        self,
+        text: str,
+        limit: int = 10,
+        known_only: bool = False,
+    ) -> list[dict]:
+        """Extract concepts from text using LLM.
+
+        Uses: ``c0 extract-concepts <text> --limit <N> --json``
+        """
+        args = ["extract-concepts", text, "--limit", str(limit), "--json"]
+        if known_only:
+            args.append("--known-only")
+        output = self._docker_exec(*args)
         if not output:
             return []
         try:
             return json.loads(output)
         except json.JSONDecodeError:
-            # Some c0 output is plain text lists
-            lines = [l.strip() for l in output.split("\n") if l.strip()]
-            return [{"raw": l} for l in lines]
+            return [{"raw": output}]
+
+    # ── Listing ───────────────────────────────────────────────────
+
+    def list_concepts(self, namespace: str = "", limit: int = 100) -> list[dict]:
+        """List concepts in a namespace.
+
+        Uses: ``c0 list concepts`` (with optional namespace via config).
+        """
+        # c0 list concepts returns tabular text
+        output = self._docker_exec("list", "concepts")
+        if not output:
+            return []
+        results = []
+        for line in output.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("─") or line.startswith("name"):
+                continue
+            results.append({"raw": line})
+        return results[:limit]
+
+    # ── Internals ─────────────────────────────────────────────────
+
+    def _docker_exec(self, *args, timeout: int = 30) -> str:
+        """Run c0 inside the Docker container and return stdout."""
+        cmd = ["docker", "exec", self.container, "c0"] + list(args)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if "not found" in stderr.lower() or "No such file" in stderr:
+                raise C0NotAvailableError(f"c0 binary not found: {stderr}")
+            raise C0Error(f"c0 failed (exit {result.returncode}): {stderr}")
+        return result.stdout.strip()
+
+    def _run_with_retry(self, *args, max_retries: int = 3, timeout: int = 30) -> str:
+        """Run c0 command with retry on transient failures."""
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                return self._docker_exec(*args, timeout=timeout)
+            except (subprocess.TimeoutExpired, C0Error) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    time.sleep(1 * (attempt + 1))
+        raise last_error  # type: ignore[misc]
 
     @staticmethod
-    def _parse_dict(output: str) -> dict:
-        """Parse c0 output into a dict."""
+    def _parse_walk_output(output: str) -> dict:
+        """Parse c0 walk text output into structured dict."""
+        result: dict = {"start": "", "patches": [], "connected": [], "hybrid_hint": ""}
         if not output:
-            return {}
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError:
-            return {"raw": output}
+            return result
+
+        section = None
+        for line in output.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # Detect hybrid hint: (hybrid: 'query' -> 'name' [rrf: score])
+            if stripped.startswith("(hybrid:") or stripped.startswith("(fulltext:"):
+                result["hybrid_hint"] = stripped
+                # Extract resolved concept name
+                if "-> '" in stripped:
+                    result["start"] = stripped.split("-> '")[1].split("'")[0]
+                continue
+
+            # Section headers
+            if stripped == "KNOWLEDGE PATCH:":
+                section = "patches"
+                continue
+            elif stripped.startswith("CONNECTED"):
+                section = "connected"
+                continue
+            elif stripped == "---":
+                continue
+
+            # Content lines
+            if section == "patches":
+                result["patches"].append(stripped)
+            elif section == "connected":
+                result["connected"].append(stripped)
+
+        # If no hybrid hint, start is first patch reference or unknown
+        if not result["start"] and result["patches"]:
+            first = result["patches"][0]
+            if first.startswith("["):
+                result["start"] = first.strip("[]")
+        elif not result["start"]:
+            result["start"] = "unknown"
+
+        return result
+
+    @staticmethod
+    def _parse_key_value(text: str) -> dict:
+        """Parse key: value or key=value lines into dict."""
+        result = {}
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if ": " in line:
+                k, v = line.split(": ", 1)
+                result[k.strip()] = v.strip()
+            elif " = " in line:
+                k, v = line.split(" = ", 1)
+                result[k.strip()] = v.strip()
+        return result
