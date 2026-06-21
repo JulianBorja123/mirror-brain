@@ -90,7 +90,7 @@ The 38 tools are very intuitive. Having helper tools like `mb_get_minimap` (retu
 ## 📝 Git Commit Details
 
 The changes have been pushed to [GitHub Repo](https://github.com/JulianBorja123/mirror-brain.git):
-- **Commit Hash:** `7e3e4ec`
+- **Commit Hash:** `7e3e4ec` (prior fixes)
 - **Message:** `fix: resolve Windows cp1252 crash, optimize relations list, add semantic search fallback, and fix integration tests`
 - **Files Modified:**
   - [mcp_server.py](file:///d:/hermes-programs/mirror-brain/mcp_server.py)
@@ -99,3 +99,92 @@ The changes have been pushed to [GitHub Repo](https://github.com/JulianBorja123/
   - [tools.py](file:///d:/hermes-programs/mirror-brain/src/mirror_brain/tools.py)
   - [scalability_test.py](file:///d:/hermes-programs/mirror-brain/tests/real/scalability_test.py)
   - [test_integration.py](file:///d:/hermes-programs/mirror-brain/tests/test_integration.py)
+
+---
+
+## 🔍 Deep Lifecycle & Stress Testing (June 21, 2026)
+
+We ran a deep lifecycle stress test harness targeting code ingestion, ID-based lookups, state updates, cache invalidation, biological clock emotional trajectories, and database scaling.
+
+### 🐛 Additional Bug Discoveries & Hardening Fixes
+During this stress test, we identified and fixed four critical bugs in the `C0Registry` and fake cursor SQL shims:
+
+1. **`AttributeError` in `_extract_type`:**
+   - **Issue:** If a concept didn't contain a description (or returned `None`), `description.startswith("type=")` crashed the entire entity retrieval pipeline.
+   - **Fix:** Added a null/type validation check returning `"concept"` if the description is empty or not a string.
+
+2. **Concept Truncation on List/Count Operations:**
+   - **Issue:** `c0.list_concepts` defaults to `limit=100`. Because `_get_consolidation_entries` and `get_all_entities` called it without a high limit, all concepts beyond the first 100 were completely sliced off and excluded *before* filtering. This meant consolidation entries (which are added later) were never seen.
+   - **Fix:** Configured `list_concepts` in the registry to request a limit of `999999` before performing filtering/slicing, guaranteeing zero data loss.
+
+3. **Incorrect SQL Shimming for Key Entity Searches:**
+   - **Issue:** In the shimming layers of `FakeCursor._fetch_consolidation_rows`, any query with a single parameter was assumed to be a date constraint filter, mapping key-entity search terms (e.g. `'%StressTester%'`) into date ranges. This filtered out all rows.
+   - **Fix:** Implemented a robust WHERE clause parser that checks if the parameter is bound to `KEY_ENTITIES` or `DATE`, resolving search term filtering correctly.
+
+4. **Column Projection Alignment in Fake Cursor:**
+   - **Issue:** `_fetch_consolidation_rows` returned standard 5-tuples directly. When queries asked for specific columns in a different order (e.g., `SELECT date, emotional_arc`), unpacking crashed or read the wrong indexes.
+   - **Fix:** Mapped records to match the column names and ordering requested in the query's SELECT clause.
+
+5. **Cache Invalidation on Writes:**
+   - **Issue:** Storing daily index entries, aliases, or module rows directly called `create_concept` without invalidating `c0`'s internal export cache, leaving old cached queries stale.
+   - **Fix:** Added `self.c0.invalidate_export_cache()` on all alias, consolidation, and module table writes.
+
+---
+
+## 🕒 Biological Clock & Emotional Cycles
+
+We simulated 15 days of emotional tracking records (simulating oxytocin oscillations) to evaluate Mirror Brain's predictive engine.
+
+* **Cycle Period Detected:** **5 days**
+* **Cycle Confidence:** **1.0 (100% confidence)**
+* **Mathematical Accuracy:** Perfect. The simulated function was `oxy_val = 0.2 + 0.6 * abs(math.sin(i * pi / 5))`. Since `abs(sin(x))` halves the sine period, the periodic oscillation occurs exactly every 5 days, which the predictive engine mathematically detected with absolute certainty.
+* **Temporal Trend Report:**
+  ```json
+  {
+    "direction": "down",
+    "slope": -0.0099,
+    "r_squared": 0.0419,
+    "confidence": 0.0419
+  }
+  ```
+
+---
+
+## 📈 Catalog Scaling & Cache Performance
+
+We registered 25 new tech devices (generating unique UUIDs and inserting them into Neo4j via c0) to test large catalog scaling.
+
+* **Total Database Size:** **999+ concepts**
+* **Average Product Registration Speed:** **~320.7ms** per product node.
+* **Search Query Latencies (warm cache):**
+  * `query 'stress testing product'`: **~246.6ms** (5/5 results)
+  * `query 'device number 15'`: **~235.2ms** (5/5 results)
+  * `query 'catalog item laptops'`: **~376.4ms** (5/5 results)
+  * `query 'Nexus stress device'`: **~265.6ms** (5/5 results)
+* **ID Lookup Performance:** **~188.7ms** (direct CLI overhead from the docker container execution).
+
+---
+
+## 📘 User Guide: Testing Mirror Brain Systems
+
+This guide describes how to run and write test scripts for Mirror Brain v3.1.
+
+### 1. Running the Pre-Commit Test Suite
+The comprehensive pre-commit test suite validates connections, queries, edge cases, data integrity, and MCP server health:
+```bash
+python tests/test_v3_comprehensive.py
+```
+*Note: Ensure the docker containers (`mirrorbrain-c0`, `mirrorbrain-neo4j`) are active before running.*
+
+### 2. Running the Stress Test Harness
+The stress test harness evaluates code ingestion, cache consistency, ID lookup, emotional cycle trends, and high-volume database registration:
+```bash
+python C:/Users/gusta/.gemini/antigravity-ide/brain/dfc318b4-1a3a-407e-b945-254046292c3f/scratch/test_lifecycle_stress.py
+```
+
+### 3. Writing Custom Integration Tests
+When writing tests that interact with `C0Registry` (e.g. simulating agent pipelines or tool usage):
+- **Avoid direct SQL writes where possible.** Use registry wrappers like `reg.create()`, `reg.update_entity()`, or shimmed `reg.db.execute()`.
+- **Always specify UTF-8 encoding on subprocesses or file reads** to prevent Windows codepage crashes.
+- **Query limits:** If listing concepts, specify a high limit (e.g. `limit=999999`) to ensure all nodes are read prior to filtering.
+

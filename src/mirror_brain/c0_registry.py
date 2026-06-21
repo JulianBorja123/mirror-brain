@@ -206,6 +206,7 @@ class C0Registry:
                 "confidence": confidence,
             }, ensure_ascii=False)
             self.c0.create_concept(name, description=data, force=True)
+            self.c0.invalidate_export_cache()
         except Exception:
             pass  # Best-effort persistence; cache already updated
 
@@ -261,7 +262,7 @@ class C0Registry:
         if cached is not None:
             return cached[:limit]
 
-        results = self.c0.list_concepts(limit=limit)
+        results = self.c0.list_concepts(limit=999999)
         entities = [
             {
                 "uuid": self._name_to_uuid(r.get("name", "")),
@@ -375,6 +376,8 @@ class C0Registry:
     @staticmethod
     def _extract_type(description: str) -> str:
         """Extract entity type from c0 description (type=X format)."""
+        if not description or not isinstance(description, str):
+            return "concept"
         if description.startswith("type="):
             parts = description.split(";")[0].split("=")
             if len(parts) > 1:
@@ -494,7 +497,7 @@ class C0Registry:
     def _count_consolidation(self, tier: str) -> int:
         """Count consolidation entries of a given tier (daily/weekly/monthly)."""
         marker = f"{self.CONSOLIDATION_PREFIX} {tier}"
-        results = self.c0.list_concepts()
+        results = self.c0.list_concepts(limit=999999)
         return sum(1 for r in results if r.get("name", "").startswith(marker))
 
     def _get_consolidation_entries(
@@ -507,7 +510,7 @@ class C0Registry:
         The description field contains the JSON blob of the consolidation result.
         """
         marker = f"{self.CONSOLIDATION_PREFIX} {tier}"
-        results = self.c0.list_concepts()
+        results = self.c0.list_concepts(limit=999999)
         entries = []
         for r in results:
             name = r.get("name", "")
@@ -537,6 +540,7 @@ class C0Registry:
         name = self._consolidation_name(tier, date_str)
         desc = f"type=consolidation_{tier};" + _json.dumps(data, ensure_ascii=False, default=str)
         self.c0.create_concept(name, description=desc, force=True)
+        self.c0.invalidate_export_cache()
 
     def _handle_consolidation_write(self, query: str, params: tuple) -> None:
         """Parse INSERT/UPDATE on consolidation tables and redirect to c0.
@@ -601,6 +605,7 @@ class C0Registry:
         data = dict(zip(columns, values))
         desc = _json.dumps(data, ensure_ascii=False, default=str)
         self.c0.create_concept(name, description=desc, force=True)
+        self.c0.invalidate_export_cache()
 
     def _handle_module_write(self, query: str, params: tuple) -> None:
         """Parse INSERT/UPDATE on module tables and redirect to c0.
@@ -826,7 +831,7 @@ class FakeCursor:
             return cached
 
         prefix = f"{self._MODULE_TABLE_PREFIX} {table}"
-        results = self.registry.c0.list_concepts(limit=500)
+        results = self.registry.c0.list_concepts(limit=999999)
 
         # Parse requested columns from SELECT ... col1, col2, ... FROM table
         q_upper = self.query.upper()
@@ -882,38 +887,66 @@ class FakeCursor:
 
 
     def _fetch_consolidation_rows(self, tier: str) -> list:
-        """Fetch consolidation entries from c0, returning tuples like SQLite would.
+        """Fetch consolidation entries from c0, returning tuples matching requested columns.
 
-        Parses the query's WHERE clause for date range filtering.
-        The description field contains the JSON blob; we unpack it into the
-        tuple format that consolidation.py expects.
-
-        daily_index expects: (date, summary, emotional_arc, key_entities, key_decisions)
-        weekly_summaries expects: (week_start, summary, key_entities, key_themes, emotional_arc, source_days)
-        monthly_summaries expects: (month_start, summary, emotional_arc, key_entities, key_themes, source_weeks)
+        Parses the query's WHERE clause for filtering and SELECT clause for column ordering.
         """
         import json as _json
+        import re
 
-        # Extract date range from WHERE clause if present
+        # Extract date range and key_entity filters from WHERE clause
         date_start = ""
         date_end = ""
+        entity_like_pattern = ""
         q_upper = self.query.upper()
-        if "WHERE" in q_upper and self.params:
-            if len(self.params) == 1:
-                # Single param: exact match (WHERE date = ?)
-                date_start = str(self.params[0]) if self.params[0] else ""
-                date_end = date_start
-            elif len(self.params) >= 2:
-                # Range: WHERE date >= ? AND date <= ?
-                date_start = str(self.params[0]) if self.params[0] else ""
-                date_end = str(self.params[1]) if self.params[1] else ""
 
+        if "WHERE" in q_upper and self.params:
+            where_part = q_upper.split("WHERE", 1)[1].split("ORDER BY", 1)[0].split("LIMIT", 1)[0]
+            parts = [p.strip() for p in where_part.split("AND")]
+            
+            param_idx = 0
+            for part in parts:
+                if "?" in part:
+                    if "DATE" in part:
+                        if ">=" in part:
+                            if param_idx < len(self.params):
+                                date_start = str(self.params[param_idx])
+                        elif "<=" in part:
+                            if param_idx < len(self.params):
+                                date_end = str(self.params[param_idx])
+                        elif "=" in part:
+                            if param_idx < len(self.params):
+                                date_start = str(self.params[param_idx])
+                                date_end = date_start
+                        elif "BETWEEN" in part:
+                            if param_idx + 1 < len(self.params):
+                                date_start = str(self.params[param_idx])
+                                date_end = str(self.params[param_idx+1])
+                            param_idx += 1
+                    elif "KEY_ENTITIES" in part:
+                        if param_idx < len(self.params):
+                            entity_like_pattern = str(self.params[param_idx]).lower().replace("%", "").strip()
+                    param_idx += 1
+
+        # Retrieve entries from C0 backend
         entries = self.registry._get_consolidation_entries(tier, date_start, date_end)
+
+        # Parse column list from SELECT ... FROM
+        select_cols = []
+        select_match = re.search(r"SELECT\s+(.+?)\s+FROM", self.query, re.IGNORECASE | re.DOTALL)
+        if select_match:
+            cols_str = select_match.group(1).strip()
+            cols_str = cols_str.replace("DISTINCT ", "").replace("distinct ", "")
+            if cols_str != "*" and cols_str != "1":
+                for c in cols_str.split(","):
+                    c = c.strip().lower()
+                    if "." in c:
+                        c = c.split(".")[-1]
+                    select_cols.append(c)
 
         rows = []
         for entry in entries:
             desc = entry.get("description", "")
-            # Parse JSON from description (after "type=consolidation_XXX;")
             json_str = desc
             if desc.startswith("type=consolidation_"):
                 json_str = desc.split(";", 1)[1] if ";" in desc else "{}"
@@ -922,31 +955,107 @@ class FakeCursor:
             except (_json.JSONDecodeError, TypeError):
                 data = {}
 
+            # Handle JSON string formatting for lists/objects to avoid double JSON serialization
+            def _normalize_json_field(val):
+                if isinstance(val, (list, dict)):
+                    return _json.dumps(val)
+                if isinstance(val, str):
+                    # Check if it's already valid JSON serialized list/dict
+                    val_stripped = val.strip()
+                    if (val_stripped.startswith("[") and val_stripped.endswith("]")) or \
+                       (val_stripped.startswith("{") and val_stripped.endswith("}")):
+                        return val
+                    return _json.dumps(val)
+                return _json.dumps(val)
+
+            # Filter by entity_like_pattern if provided
+            if entity_like_pattern:
+                key_ents = data.get("key_entities", [])
+                if isinstance(key_ents, str):
+                    try:
+                        key_ents = _json.loads(key_ents)
+                    except Exception:
+                        pass
+                if not isinstance(key_ents, list):
+                    key_ents = [str(key_ents)]
+                if not any(entity_like_pattern in str(ent).lower() for ent in key_ents):
+                    continue
+
+            # Build record dict
+            record = {}
             if tier == "daily":
-                rows.append((
-                    entry["date"],
-                    data.get("summary", ""),
-                    _json.dumps(data.get("emotional_arc", [])),
-                    _json.dumps(data.get("key_entities", [])),
-                    _json.dumps(data.get("key_decisions", [])),
-                ))
+                record = {
+                    "date": entry["date"],
+                    "summary": data.get("summary", ""),
+                    "emotional_arc": _normalize_json_field(data.get("emotional_arc", [])),
+                    "key_entities": _normalize_json_field(data.get("key_entities", [])),
+                    "key_decisions": _normalize_json_field(data.get("key_decisions", [])),
+                    "created_at": entry["date"]
+                }
             elif tier == "weekly":
-                rows.append((
-                    entry["date"],
-                    data.get("summary", ""),
-                    _json.dumps(data.get("key_entities", [])),
-                    _json.dumps(data.get("key_themes", [])),
-                    _json.dumps(data.get("emotional_arc", [])),
-                    _json.dumps(data.get("source_days", [])),
-                ))
+                record = {
+                    "week_start": entry["date"],
+                    "summary": data.get("summary", ""),
+                    "key_entities": _normalize_json_field(data.get("key_entities", [])),
+                    "key_themes": _normalize_json_field(data.get("key_themes", [])),
+                    "emotional_arc": _normalize_json_field(data.get("emotional_arc", [])),
+                    "source_days": _normalize_json_field(data.get("source_days", [])),
+                    "created_at": entry["date"]
+                }
             elif tier == "monthly":
-                rows.append((
-                    entry["date"],
-                    data.get("summary", ""),
-                    _json.dumps(data.get("emotional_arc", [])),
-                    _json.dumps(data.get("key_entities", [])),
-                    _json.dumps(data.get("key_themes", [])),
-                    _json.dumps(data.get("source_weeks", [])),
-                ))
+                record = {
+                    "month_start": entry["date"],
+                    "summary": data.get("summary", ""),
+                    "emotional_arc": _normalize_json_field(data.get("emotional_arc", [])),
+                    "key_entities": _normalize_json_field(data.get("key_entities", [])),
+                    "key_themes": _normalize_json_field(data.get("key_themes", [])),
+                    "source_weeks": _normalize_json_field(data.get("source_weeks", [])),
+                    "created_at": entry["date"]
+                }
+
+            # Map record to requested columns
+            if not select_cols:
+                # Return standard tuple order expected by consolidation.py
+                if tier == "daily":
+                    row_tuple = (
+                        record["date"],
+                        record["summary"],
+                        record["emotional_arc"],
+                        record["key_entities"],
+                        record["key_decisions"]
+                    )
+                elif tier == "weekly":
+                    row_tuple = (
+                        record["week_start"],
+                        record["summary"],
+                        record["key_entities"],
+                        record["key_themes"],
+                        record["emotional_arc"],
+                        record["source_days"]
+                    )
+                elif tier == "monthly":
+                    row_tuple = (
+                        record["month_start"],
+                        record["summary"],
+                        record["emotional_arc"],
+                        record["key_entities"],
+                        record["key_themes"],
+                        record["source_weeks"]
+                    )
+            else:
+                row_vals = []
+                for col in select_cols:
+                    if col == "1":
+                        row_vals.append(1)
+                    elif col.startswith("count(") or col.startswith("distinct"):
+                        row_vals.append(1)
+                    else:
+                        val = record.get(col, "")
+                        if not val and col == "date":
+                            val = record.get("week_start") or record.get("month_start") or ""
+                        row_vals.append(val)
+                row_tuple = tuple(row_vals)
+
+            rows.append(row_tuple)
 
         return rows
